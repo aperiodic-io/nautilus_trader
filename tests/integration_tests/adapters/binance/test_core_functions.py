@@ -16,8 +16,12 @@
 import pytest
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
+from nautilus_trader.adapters.binance.common.positions import make_venue_position_id
 from nautilus_trader.adapters.binance.common.symbol import BinanceSymbol
 from nautilus_trader.adapters.binance.common.symbol import BinanceSymbols
+from nautilus_trader.model.identifiers import AccountId
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import PositionId
 
 
 class TestBinanceCoreFunctions:
@@ -137,3 +141,22 @@ class TestBinanceCoreFunctions:
     def test_binance_account_type_is_futures(self, account_type, expected):
         # Arrange, Act, Assert
         assert account_type.is_futures == expected
+
+    @pytest.mark.parametrize(
+        ("account_id", "expected"),
+        [
+            # Primary account for the venue keeps the plain ID
+            ("BINANCE-USDT_FUTURES-master", "ETHUSDT-PERP.BINANCE-LONG"),
+            # Additional accounts are suffixed with the account issuer
+            ("BINANCE2-USDT_FUTURES-master", "ETHUSDT-PERP.BINANCE-LONG-BINANCE2"),
+        ],
+    )
+    def test_make_venue_position_id(self, account_id, expected):
+        # Arrange
+        instrument_id = InstrumentId.from_str("ETHUSDT-PERP.BINANCE")
+
+        # Act
+        result = make_venue_position_id(instrument_id, "LONG", AccountId(account_id))
+
+        # Assert
+        assert result == PositionId(expected)

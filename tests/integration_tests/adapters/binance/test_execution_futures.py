@@ -2495,9 +2495,13 @@ class TestBinanceFuturesExecutionClient:
             price=Price.from_str("3000.00"),
         )
         self.cache.add_order(limit_order, None)
-        limit_order.apply(TestEventStubs.order_submitted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_submitted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
-        limit_order.apply(TestEventStubs.order_accepted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_accepted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
 
         command = CancelAllOrders(
@@ -2536,7 +2540,9 @@ class TestBinanceFuturesExecutionClient:
             price=Price.from_str("3000.00"),
         )
         self.cache.add_order(limit_order, None)
-        limit_order.apply(TestEventStubs.order_submitted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_submitted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
 
         command = CancelAllOrders(
@@ -2575,9 +2581,13 @@ class TestBinanceFuturesExecutionClient:
             price=Price.from_str("3000.00"),
         )
         self.cache.add_order(limit_order, None)
-        limit_order.apply(TestEventStubs.order_submitted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_submitted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
-        limit_order.apply(TestEventStubs.order_accepted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_accepted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
         limit_order.apply(TestEventStubs.order_pending_cancel(limit_order))
         self.cache.update_order(limit_order)
@@ -2624,9 +2634,13 @@ class TestBinanceFuturesExecutionClient:
             price=Price.from_str("3000.00"),
         )
         self.cache.add_order(limit_order, None)
-        limit_order.apply(TestEventStubs.order_submitted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_submitted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
-        limit_order.apply(TestEventStubs.order_accepted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_accepted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
 
         stop_order = self.strategy.order_factory.stop_market(
@@ -2636,9 +2650,13 @@ class TestBinanceFuturesExecutionClient:
             trigger_price=Price.from_str("2900.00"),
         )
         self.cache.add_order(stop_order, None)
-        stop_order.apply(TestEventStubs.order_submitted(stop_order))
+        stop_order.apply(
+            TestEventStubs.order_submitted(stop_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(stop_order)
-        stop_order.apply(TestEventStubs.order_accepted(stop_order))
+        stop_order.apply(
+            TestEventStubs.order_accepted(stop_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(stop_order)
 
         command = CancelAllOrders(
@@ -2687,9 +2705,13 @@ class TestBinanceFuturesExecutionClient:
             price=Price.from_str("3000.00"),
         )
         self.cache.add_order(strategy_order, None)
-        strategy_order.apply(TestEventStubs.order_submitted(strategy_order))
+        strategy_order.apply(
+            TestEventStubs.order_submitted(strategy_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(strategy_order)
-        strategy_order.apply(TestEventStubs.order_accepted(strategy_order))
+        strategy_order.apply(
+            TestEventStubs.order_accepted(strategy_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(strategy_order)
 
         other_strategy = Strategy(config=StrategyConfig(strategy_id="other"))
@@ -2707,9 +2729,13 @@ class TestBinanceFuturesExecutionClient:
             price=Price.from_str("3100.00"),
         )
         self.cache.add_order(other_order, None)
-        other_order.apply(TestEventStubs.order_submitted(other_order))
+        other_order.apply(
+            TestEventStubs.order_submitted(other_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(other_order)
-        other_order.apply(TestEventStubs.order_accepted(other_order))
+        other_order.apply(
+            TestEventStubs.order_accepted(other_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(other_order)
 
         command = CancelAllOrders(
@@ -2727,6 +2753,56 @@ class TestBinanceFuturesExecutionClient:
         # Assert - should use individual cancel, not batch
         mock_cancel_orders_for_strategy.assert_called_once()
         mock_cancel_orders_batch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_orders_ignores_orders_of_other_account(self, mocker):
+        """
+        Test that _cancel_all_orders only cancels orders of this client's account when
+        another account for the venue has orders for the same strategy and instrument.
+        """
+        # Arrange
+        mock_cancel_orders_for_strategy = mocker.patch.object(
+            self.exec_client,
+            "_cancel_orders_for_strategy",
+            new_callable=AsyncMock,
+        )
+        mock_cancel_orders_batch = mocker.patch.object(
+            self.exec_client,
+            "_cancel_orders_batch",
+            new_callable=AsyncMock,
+        )
+
+        orders = []
+        for account_id in (self.exec_client.account_id, AccountId("BINANCE2-USDT_FUTURES-master")):
+            order = self.strategy.order_factory.limit(
+                instrument_id=ETHUSDT_PERP_BINANCE.id,
+                order_side=OrderSide.BUY,
+                quantity=Quantity.from_int(10),
+                price=Price.from_str("3000.00"),
+            )
+            self.cache.add_order(order, None)
+            order.apply(TestEventStubs.order_submitted(order, account_id=account_id))
+            self.cache.update_order(order)
+            order.apply(TestEventStubs.order_accepted(order, account_id=account_id))
+            self.cache.update_order(order)
+            orders.append(order)
+
+        command = CancelAllOrders(
+            trader_id=self.trader_id,
+            strategy_id=self.strategy.id,
+            instrument_id=ETHUSDT_PERP_BINANCE.id,
+            order_side=OrderSide.NO_ORDER_SIDE,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act
+        await self.exec_client._cancel_all_orders(command)
+
+        # Assert - the strategy owns all orders of this account, so batch cancel applies
+        mock_cancel_orders_for_strategy.assert_not_called()
+        mock_cancel_orders_batch.assert_called_once()
+        assert mock_cancel_orders_batch.call_args[0][1] == [orders[0]]
 
     @pytest.mark.asyncio
     async def test_cancel_all_orders_does_not_double_count_pending_update(self, mocker):
@@ -2748,9 +2824,13 @@ class TestBinanceFuturesExecutionClient:
             price=Price.from_str("3000.00"),
         )
         self.cache.add_order(limit_order, None)
-        limit_order.apply(TestEventStubs.order_submitted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_submitted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
-        limit_order.apply(TestEventStubs.order_accepted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_accepted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
         limit_order.apply(TestEventStubs.order_pending_update(limit_order))
         self.cache.update_order(limit_order)
@@ -2797,9 +2877,13 @@ class TestBinanceFuturesExecutionClient:
             price=Price.from_str("3000.00"),
         )
         self.cache.add_order(strategy_order, None)
-        strategy_order.apply(TestEventStubs.order_submitted(strategy_order))
+        strategy_order.apply(
+            TestEventStubs.order_submitted(strategy_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(strategy_order)
-        strategy_order.apply(TestEventStubs.order_accepted(strategy_order))
+        strategy_order.apply(
+            TestEventStubs.order_accepted(strategy_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(strategy_order)
 
         other_strategy = Strategy(config=StrategyConfig(strategy_id="other"))
@@ -2819,7 +2903,9 @@ class TestBinanceFuturesExecutionClient:
             price=Price.from_str("3100.00"),
         )
         self.cache.add_order(other_order, None)
-        other_order.apply(TestEventStubs.order_submitted(other_order))
+        other_order.apply(
+            TestEventStubs.order_submitted(other_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(other_order)
 
         command = CancelAllOrders(

@@ -62,6 +62,8 @@ from nautilus_trader.model.functions cimport trailing_offset_type_to_str
 from nautilus_trader.model.identifiers cimport AccountId
 from nautilus_trader.model.identifiers cimport ComponentId
 from nautilus_trader.model.identifiers cimport InstrumentId
+from nautilus_trader.model.identifiers cimport PositionId
+from nautilus_trader.model.identifiers cimport Venue
 from nautilus_trader.model.instruments.base cimport Instrument
 from nautilus_trader.model.objects cimport Currency
 from nautilus_trader.model.objects cimport Money
@@ -449,7 +451,7 @@ cdef class RiskEngine(Component):
         if not self._check_order(instrument, order):
             return  # Denied
 
-        if not self._check_orders_risk(instrument, [order]):
+        if not self._check_orders_risk(instrument, [order], self._resolve_account_id(command)):
             return # Denied
 
         self._execution_gateway(instrument, command)
@@ -487,7 +489,11 @@ cdef class RiskEngine(Component):
                 return  # Denied
 
         cdef Instrument representative = instruments[command.instrument_id]
-        if not self._check_orders_risk(representative, order_list.orders):
+        if not self._check_orders_risk(
+            representative,
+            order_list.orders,
+            self._resolve_account_id(command),
+        ):
             self._deny_order_list(order_list, f"OrderList {order_list.id.to_str()} DENIED")
             return  # Denied
 
@@ -639,21 +645,46 @@ cdef class RiskEngine(Component):
 
         return True  # Passed
 
-    cpdef bint _check_orders_risk(self, Instrument instrument, list orders):
+    cdef AccountId _resolve_account_id(self, TradingCommand command):
+        # Resolve the account a command targets before the orders are assigned an
+        # account ID (on submission), for venues with multiple accounts
+        cdef AccountId account_id = None
+        cdef PositionId position_id = None
+        cdef Position position
+        if command.client_id is not None:
+            account_id = self._cache.account_id(Venue(command.client_id.value))
+            if account_id is not None:
+                return account_id
+
+        if isinstance(command, SubmitOrder):
+            position_id = (<SubmitOrder>command).position_id
+        elif isinstance(command, SubmitOrderList):
+            position_id = (<SubmitOrderList>command).position_id
+
+        if position_id is not None:
+            position = self._cache.position(position_id)
+            if position is not None:
+                return position.account_id
+
+        return None
+
+    cpdef bint _check_orders_risk(self, Instrument instrument, list orders, AccountId default_account_id = None):
         ########################################################################
         # RISK CHECKS
         ########################################################################
 
         # Group orders by account_id to handle multiple accounts per instrument
+        # (orders not yet assigned an account use the account resolved for the command)
         cdef dict orders_by_account = {}  # type: dict[AccountId, list]
         cdef:
             Order order
             AccountId account_id
         for order in orders:
-            if order.account_id not in orders_by_account:
-                orders_by_account[order.account_id] = []
+            account_id = order.account_id if order.account_id is not None else default_account_id
+            if account_id not in orders_by_account:
+                orders_by_account[account_id] = []
 
-            orders_by_account[order.account_id].append(order)
+            orders_by_account[account_id].append(order)
 
         # Check each account group separately
         cdef list account_orders
@@ -705,6 +736,7 @@ cdef class RiskEngine(Component):
             instrument.id,
             None,
             PositionSide.LONG,
+            account.id,
         )
         cdef Quantity net_long_qty = Quantity.zero_c(instrument.size_precision)
         cdef Position position
@@ -720,6 +752,7 @@ cdef class RiskEngine(Component):
             instrument.id,
             None,
             OrderSide.SELL,
+            account.id,
         )
         cdef Quantity submitted_sell_qty = Quantity.zero_c(instrument.size_precision)
         cdef Order open_order

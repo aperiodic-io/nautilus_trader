@@ -849,7 +849,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
     async def _query_position_status_reports(
         self,
-    ) -> tuple[dict[InstrumentAccountKey, PositionStatusReport], set[Venue | None]]:
+    ) -> tuple[dict[InstrumentAccountKey, PositionStatusReport], set[Venue | AccountId | None]]:
         clients = list(self._clients.values())
 
         tasks = [
@@ -873,11 +873,16 @@ class LiveExecutionEngine(ExecutionEngine):
             return {}, {client.venue for client in clients}
 
         venue_positions: dict[InstrumentAccountKey, PositionStatusReport] = {}
-        failed_venues: set[Venue | None] = set()
+        failed_venues: set[Venue | AccountId | None] = set()
 
         for client, reports_or_exception in zip(clients, position_reports_all, strict=True):
             if isinstance(reports_or_exception, BaseException):
-                failed_venues.add(client.venue)
+                # Where a venue has multiple clients (accounts), scope the failure to the account
+                venue_client_count = sum(1 for c in clients if c.venue == client.venue)
+                if client.venue is not None and venue_client_count > 1 and client.account_id:
+                    failed_venues.add(client.account_id)
+                else:
+                    failed_venues.add(client.venue)
                 self._log.error(
                     f"Failed to generate position status reports for venue {client.venue}: "
                     f"{reports_or_exception}",
@@ -894,7 +899,7 @@ class LiveExecutionEngine(ExecutionEngine):
         self,
         positions_by_key: dict[InstrumentAccountKey, list[Position]],
         venue_positions: dict[InstrumentAccountKey, PositionStatusReport],
-        failed_position_report_venues: set[Venue | None] | None = None,
+        failed_position_report_venues: set[Venue | AccountId | None] | None = None,
     ) -> None:
         clients = self._clients.values()
 
@@ -904,6 +909,7 @@ class LiveExecutionEngine(ExecutionEngine):
             if venue_report is None and self._did_position_status_query_fail(
                 instrument_id,
                 failed_position_report_venues,
+                account_id,
             ):
                 self._log.warning(
                     f"Skipping position reconciliation for {instrument_id}: "
@@ -1009,7 +1015,8 @@ class LiveExecutionEngine(ExecutionEngine):
     def _did_position_status_query_fail(
         self,
         instrument_id: InstrumentId,
-        failed_position_report_venues: set[Venue | None] | None,
+        failed_position_report_venues: set[Venue | AccountId | None] | None,
+        account_id: AccountId | None = None,
     ) -> bool:
         if not failed_position_report_venues:
             return False
@@ -1017,6 +1024,7 @@ class LiveExecutionEngine(ExecutionEngine):
         return (
             None in failed_position_report_venues
             or instrument_id.venue in failed_position_report_venues
+            or (account_id is not None and account_id in failed_position_report_venues)
         )
 
     def _create_flat_position_report(
@@ -2209,6 +2217,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     venue_order_id=report.venue_order_id,
                     instrument_id=report.instrument_id,
                     order_side=None,  # Don't filter by side to find any matching order
+                    account_id=report.account_id,
                 )
 
                 if order is not None:
@@ -2669,6 +2678,7 @@ class LiveExecutionEngine(ExecutionEngine):
                 quantity=close_quantity,
                 price=close_price,
                 avg_px=close_avg_px,
+                account_id=report.account_id,
             )
 
             if matching_close_order:
@@ -2772,6 +2782,7 @@ class LiveExecutionEngine(ExecutionEngine):
                 quantity=open_quantity,
                 price=open_price,
                 avg_px=open_avg_px,
+                account_id=report.account_id,
             )
 
             if matching_open_order:
@@ -2897,6 +2908,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     quantity=diff_quantity,
                     price=reconciliation_price,
                     avg_px=avg_px,
+                    account_id=report.account_id,
                 )
 
             if matching_diff_order:
@@ -2963,6 +2975,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     quantity=diff_quantity,
                     price=None,
                     avg_px=None,
+                    account_id=report.account_id,
                 )
 
             if matching_diff_order:
@@ -3117,6 +3130,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     venue_order_id=report.venue_order_id,
                     instrument_id=report.instrument_id,
                     order_side=report.order_side,
+                    account_id=report.account_id,
                 )
 
                 if cached_order is not None:
@@ -3493,6 +3507,9 @@ class LiveExecutionEngine(ExecutionEngine):
         if client_id is not None:
             client = self._clients.get(client_id)
 
+        if client is None and report.account_id is not None:
+            client = self._clients.get(ClientId(report.account_id.get_issuer()))
+
         if client is None:
             client = self._routing_map.get(instrument.id.venue, self._default_client)
 
@@ -3770,6 +3787,7 @@ class LiveExecutionEngine(ExecutionEngine):
         quantity: Quantity,
         price: Price | None,
         avg_px: Decimal | None,
+        account_id: AccountId | None = None,
     ) -> Order | None:
         # Search cache for existing order matching reconciliation parameters
         cached_orders = self._cache.orders(
@@ -3779,6 +3797,9 @@ class LiveExecutionEngine(ExecutionEngine):
         )
 
         for cached_order in cached_orders:
+            if not self._is_order_for_account(cached_order, account_id):
+                continue
+
             # Check if order is filled and matches the parameters
             if cached_order.status != OrderStatus.FILLED:
                 continue
@@ -3807,6 +3828,7 @@ class LiveExecutionEngine(ExecutionEngine):
         venue_order_id: VenueOrderId,
         instrument_id: InstrumentId,
         order_side: OrderSide | None = None,
+        account_id: AccountId | None = None,
     ) -> Order | None:
         # Fallback search when venue_order_id index not built
         cached_orders = self._cache.orders(
@@ -3816,7 +3838,15 @@ class LiveExecutionEngine(ExecutionEngine):
         )
 
         for cached_order in cached_orders:
+            if not self._is_order_for_account(cached_order, account_id):
+                continue
+
             if cached_order.venue_order_id == venue_order_id:
                 return cached_order
 
         return None
+
+    @staticmethod
+    def _is_order_for_account(order: Order, account_id: AccountId | None) -> bool:
+        # Orders not yet assigned an account can match any account
+        return account_id is None or order.account_id is None or order.account_id == account_id

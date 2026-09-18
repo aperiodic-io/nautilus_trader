@@ -3642,6 +3642,115 @@ class TestRiskEngineWithCashAccount:
         # Assert
         assert order.status == OrderStatus.DENIED
 
+    def _register_secondary_cash_client(self, free_usd: int) -> AccountId:
+        secondary_client = MockExecutionClient(
+            client_id=ClientId("SIM2"),
+            venue=self.venue,
+            account_type=AccountType.CASH,
+            base_currency=USD,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_client(secondary_client)
+        secondary_account_id = AccountId("SIM2-001")
+        self.portfolio.update_account(
+            AccountState(
+                account_id=secondary_account_id,
+                account_type=AccountType.CASH,
+                base_currency=USD,
+                reported=True,
+                balances=[
+                    AccountBalance(
+                        Money(free_usd, USD),
+                        Money(0, USD),
+                        Money(free_usd, USD),
+                    ),
+                ],
+                margins=[],
+                info={},
+                event_id=UUID4(),
+                ts_event=0,
+                ts_init=0,
+            ),
+        )
+        return secondary_account_id
+
+    def test_submit_order_with_client_id_checks_free_balance_of_client_account(self):
+        # Arrange
+        self._register_secondary_cash_client(free_usd=100)
+        self.exec_engine.start()
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.cache.add_quote_tick(TestDataStubs.quote_tick(instrument=_AUDUSD_SIM))
+
+        primary_order = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        secondary_order = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        # Act
+        strategy.submit_order(primary_order)
+        strategy.submit_order(secondary_order, client_id=ClientId("SIM2"))
+
+        # Assert
+        assert primary_order.status == OrderStatus.INITIALIZED
+        assert secondary_order.status == OrderStatus.DENIED
+        assert self.exec_engine.command_count == 1
+
+    def test_submit_sell_order_on_account_without_long_position_is_balance_checked(self):
+        # Arrange
+        self._register_secondary_cash_client(free_usd=100)
+        self.exec_engine.start()
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.cache.add_quote_tick(TestDataStubs.quote_tick(instrument=_AUDUSD_SIM))
+
+        # Open a LONG position on the primary account
+        entry_order = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        strategy.submit_order(entry_order)
+        self.exec_engine.process(TestEventStubs.order_submitted(entry_order))
+        self.exec_engine.process(TestEventStubs.order_accepted(entry_order))
+        self.exec_engine.process(TestEventStubs.order_filled(entry_order, _AUDUSD_SIM))
+        assert len(self.cache.positions_open()) == 1
+
+        exit_order = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+        )
+
+        # Act - the LONG position on the primary account does not reduce on the secondary
+        strategy.submit_order(exit_order, client_id=ClientId("SIM2"))
+
+        # Assert
+        assert exit_order.status == OrderStatus.DENIED
+        assert self.exec_engine.command_count == 1
+
 
 class TestRiskEngineWithBettingAccount:
     def setup(self):

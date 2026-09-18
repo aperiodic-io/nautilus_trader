@@ -252,6 +252,37 @@ engine settles those snapshots into the corrected history's own closed cycles an
 each cycle once. A void confined to the current cycle leaves the archive intact. See
 [Position snapshotting](positions.md#position-snapshotting).
 
+## Multiple accounts per venue
+
+A live node can register several execution clients for the same venue, one per account. The
+first client registered for a venue keeps the venue routing; each further client is registered
+as an additional client for that venue. Client IDs must not contain a hyphen, because the account
+ID issuer (the part before the first `-`) must equal the client ID.
+
+The `ExecutionEngine` routes commands in this order:
+
+1. An explicit `client_id` on the command.
+2. The client the order was routed to (for modify, cancel, and query commands).
+3. The client of the account that the order, or the position an order targets, belongs to.
+   `Strategy.close_position` therefore routes to the account holding the position.
+4. The client with the venue routing.
+5. The default client.
+
+Orders for an additional account must be submitted with its `client_id`. A `CancelAllOrders`
+command without a `client_id` goes to every client for the venue, and each cancels the orders of
+its own account. A `BatchCancelOrders` command without a `client_id` is split by the client each
+order was routed to.
+
+Positions are kept separate per account. Under `NETTING`, position IDs for an additional client
+are suffixed with its client ID, `{instrument_id}-{strategy_id}-{client_id}`, so one strategy can
+hold a position on the same instrument in each account. The engine does not apply a fill to a
+position that belongs to a different account.
+
+The `RiskEngine` checks orders against the account that the `client_id` (or the targeted
+position) resolves to. Portfolio and cache account lookups by venue return the primary account
+only; pass an `account_id` to query an additional account, for example
+`portfolio.account(account_id=AccountId("BINANCE2-USDT_FUTURES-master"))`.
+
 ## Risk engine
 
 The `RiskEngine` is a component of every Nautilus system, including backtest, sandbox, and live

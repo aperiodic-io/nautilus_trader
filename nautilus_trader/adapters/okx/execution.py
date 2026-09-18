@@ -2229,7 +2229,10 @@ class OKXExecutionClient(LiveExecutionClient):
                 instrument_id=nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value),
             )
         except Exception as e:
-            orders_open = self._cache.orders_open(instrument_id=command.instrument_id)
+            orders_open = self._cache.orders_open(
+                instrument_id=command.instrument_id,
+                account_id=self.account_id,
+            )
             for order in orders_open:
                 if not order.is_closed:
                     self.generate_order_cancel_rejected(
@@ -2297,7 +2300,10 @@ class OKXExecutionClient(LiveExecutionClient):
             )
         except Exception as e:
             # If mass cancel fails, generate cancel rejected events for all open orders
-            orders_open = self._cache.orders_open(instrument_id=command.instrument_id)
+            orders_open = self._cache.orders_open(
+                instrument_id=command.instrument_id,
+                account_id=self.account_id,
+            )
             for order in orders_open:
                 if not order.is_closed:
                     self.generate_order_cancel_rejected(
@@ -2310,7 +2316,10 @@ class OKXExecutionClient(LiveExecutionClient):
                     )
 
     async def _cancel_all_orders_individually(self, command: CancelAllOrders) -> None:
-        orders_open: list[Order] = self._cache.orders_open(instrument_id=command.instrument_id)
+        orders_open: list[Order] = self._cache.orders_open(
+            instrument_id=command.instrument_id,
+            account_id=self.account_id,
+        )
         regular_cancels: list[CancelOrder] = []
         algo_cancels: list[tuple[ClientOrderId, InstrumentId, str]] = []
 

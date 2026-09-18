@@ -28,6 +28,8 @@ from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.data.engine import DataEngine
 from nautilus_trader.execution.engine import ExecutionEngine
+from nautilus_trader.execution.messages import BatchCancelOrders
+from nautilus_trader.execution.messages import CancelAllOrders
 from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.messages import ModifyOrder
 from nautilus_trader.execution.messages import QueryAccount
@@ -4826,3 +4828,435 @@ class TestExecutionEngine:
         )
         client = engine._find_client_for_command(query_cmd)
         assert client.id == ib_client_id, "QueryAccount should route by account_id issuer"
+
+
+class _BatchCancelMockExecutionClient(MockExecutionClient):
+    def batch_cancel_orders(self, command) -> None:
+        self.calls.append("batch_cancel_orders")
+        self.commands.append(command)
+
+
+class TestExecutionEngineMultiAccount:
+    def setup(self) -> None:
+        # Fixture Setup
+        self.clock = TestClock()
+        self.trader_id = TestIdStubs.trader_id()
+
+        self.msgbus = MessageBus(
+            trader_id=self.trader_id,
+            clock=self.clock,
+        )
+        self.cache = Cache(database=MockCacheDatabase())
+        self.portfolio = Portfolio(
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine = ExecutionEngine(
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            config=ExecEngineConfig(debug=True),
+        )
+        self.risk_engine = RiskEngine(
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.cache.add_instrument(AUDUSD_SIM)
+
+        self.venue = Venue("SIM")
+        self.primary_account_id = AccountId("SIM-001")
+        self.secondary_account_id = AccountId("SIM2-001")
+        self.primary_client = _BatchCancelMockExecutionClient(
+            client_id=ClientId("SIM"),
+            venue=self.venue,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.secondary_client = _BatchCancelMockExecutionClient(
+            client_id=ClientId("SIM2"),
+            venue=self.venue,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_client(self.primary_client)
+        self.exec_engine.register_client(self.secondary_client)
+        self.portfolio.update_account(TestEventStubs.margin_account_state(self.primary_account_id))
+        self.portfolio.update_account(
+            TestEventStubs.margin_account_state(self.secondary_account_id),
+        )
+
+        self.strategy = Strategy(StrategyConfig(oms_type="NETTING"))
+        self.strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_oms_type(self.strategy)
+        self.exec_engine.start()
+
+    def _market_order(self, side: OrderSide = OrderSide.BUY, quantity: int = 100_000) -> Order:
+        return self.strategy.order_factory.market(
+            AUDUSD_SIM.id,
+            side,
+            Quantity.from_int(quantity),
+        )
+
+    def _submit(
+        self,
+        order: Order,
+        client_id: ClientId | None = None,
+        position_id: PositionId | None = None,
+    ) -> None:
+        self.exec_engine.execute(
+            SubmitOrder(
+                trader_id=self.trader_id,
+                strategy_id=self.strategy.id,
+                order=order,
+                position_id=position_id,
+                client_id=client_id,
+                command_id=UUID4(),
+                ts_init=self.clock.timestamp_ns(),
+            ),
+        )
+
+    def _fill(self, order: Order, account_id: AccountId, venue_order_id: str) -> None:
+        self.exec_engine.process(TestEventStubs.order_submitted(order, account_id=account_id))
+        self.exec_engine.process(
+            TestEventStubs.order_accepted(
+                order,
+                account_id=account_id,
+                venue_order_id=VenueOrderId(venue_order_id),
+            ),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                order,
+                AUDUSD_SIM,
+                account_id=account_id,
+                venue_order_id=VenueOrderId(venue_order_id),
+                trade_id=TradeId(f"T-{venue_order_id}"),
+            ),
+        )
+
+    def _cancel_order(self, order: Order, client_id: ClientId | None = None) -> CancelOrder:
+        return CancelOrder(
+            trader_id=self.trader_id,
+            strategy_id=self.strategy.id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+            client_id=client_id,
+        )
+
+    def test_second_client_for_venue_registers_as_additional_client(self) -> None:
+        # Assert
+        assert self.exec_engine.registered_clients == [ClientId("SIM"), ClientId("SIM2")]
+        assert self.exec_engine._routing_map[self.venue] == self.primary_client
+        assert self.exec_engine._secondary_clients == {ClientId("SIM2"): self.venue}
+
+    def test_deregister_secondary_client(self) -> None:
+        # Act
+        self.exec_engine.deregister_client(self.secondary_client)
+
+        # Assert
+        assert self.exec_engine.registered_clients == [ClientId("SIM")]
+        assert self.exec_engine._secondary_clients == {}
+        assert self.exec_engine._routing_map[self.venue] == self.primary_client
+
+    def test_register_venue_routing_promotes_secondary_client(self) -> None:
+        # Act
+        self.exec_engine.register_venue_routing(self.secondary_client, self.venue)
+
+        # Assert
+        assert self.exec_engine._routing_map[self.venue] == self.secondary_client
+        assert self.exec_engine._secondary_clients == {}
+
+    def test_submit_order_without_client_id_routes_to_venue_client(self) -> None:
+        # Arrange
+        order = self._market_order()
+
+        # Act
+        self._submit(order)
+
+        # Assert
+        assert self.primary_client.calls == ["_start", "submit_order"]
+        assert self.secondary_client.calls == ["_start"]
+        assert self.cache.client_id(order.client_order_id) is None
+
+    def test_submit_order_with_client_id_routes_to_secondary_client(self) -> None:
+        # Arrange
+        order = self._market_order()
+
+        # Act
+        self._submit(order, client_id=ClientId("SIM2"))
+
+        # Assert
+        assert self.primary_client.calls == ["_start"]
+        assert self.secondary_client.calls == ["_start", "submit_order"]
+        assert self.cache.client_id(order.client_order_id) == ClientId("SIM2")
+
+    def test_cancel_and_modify_route_to_account_of_order(self) -> None:
+        # Arrange
+        order = self.strategy.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+            Price.from_str("1.00000"),
+        )
+        self.cache.add_order(order)
+        order.apply(TestEventStubs.order_submitted(order, account_id=self.secondary_account_id))
+        modify = ModifyOrder(
+            trader_id=self.trader_id,
+            strategy_id=self.strategy.id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=None,
+            quantity=Quantity.from_int(50_000),
+            price=None,
+            trigger_price=None,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.exec_engine.execute(modify)
+        self.exec_engine.execute(self._cancel_order(order))
+
+        # Assert
+        assert self.primary_client.calls == ["_start"]
+        assert self.secondary_client.calls == ["_start", "modify_order", "cancel_order"]
+
+    def test_cancel_routes_to_pinned_client_before_order_has_account(self) -> None:
+        # Arrange
+        order = self._market_order()
+        self._submit(order, client_id=ClientId("SIM2"))
+
+        # Act
+        self.exec_engine.execute(self._cancel_order(order))
+
+        # Assert
+        assert self.primary_client.calls == ["_start"]
+        assert self.secondary_client.calls == ["_start", "submit_order", "cancel_order"]
+
+    def test_netting_positions_are_separate_per_account(self) -> None:
+        # Arrange
+        order1 = self._market_order()
+        order2 = self._market_order()
+        self._submit(order1)
+        self._submit(order2, client_id=ClientId("SIM2"))
+
+        # Act
+        self._fill(order1, self.primary_account_id, "1")
+        self._fill(order2, self.secondary_account_id, "2")
+
+        # Assert
+        primary_position_id = PositionId(f"{AUDUSD_SIM.id}-{self.strategy.id}")
+        secondary_position_id = PositionId(f"{AUDUSD_SIM.id}-{self.strategy.id}-SIM2")
+        primary_position = self.cache.position(primary_position_id)
+        secondary_position = self.cache.position(secondary_position_id)
+        assert primary_position.account_id == self.primary_account_id
+        assert primary_position.quantity == Quantity.from_int(100_000)
+        assert secondary_position.account_id == self.secondary_account_id
+        assert secondary_position.quantity == Quantity.from_int(100_000)
+        assert len(self.cache.positions_open(instrument_id=AUDUSD_SIM.id)) == 2
+
+    def test_close_position_routes_to_position_account(self) -> None:
+        # Arrange
+        order1 = self._market_order()
+        self._submit(order1, client_id=ClientId("SIM2"))
+        self._fill(order1, self.secondary_account_id, "1")
+        position_id = PositionId(f"{AUDUSD_SIM.id}-{self.strategy.id}-SIM2")
+        position = self.cache.position(position_id)
+
+        # Act
+        self.strategy.close_position(position)
+
+        # Assert
+        assert self.primary_client.calls == ["_start"]
+        assert self.secondary_client.calls == ["_start", "submit_order", "submit_order"]
+        close_command = self.secondary_client.commands[-1]
+        assert close_command.position_id == position_id
+
+    def test_close_position_fill_reduces_secondary_account_position(self) -> None:
+        # Arrange
+        order1 = self._market_order()
+        self._submit(order1, client_id=ClientId("SIM2"))
+        self._fill(order1, self.secondary_account_id, "1")
+        position_id = PositionId(f"{AUDUSD_SIM.id}-{self.strategy.id}-SIM2")
+        self.strategy.close_position(self.cache.position(position_id))
+        close_order = self.secondary_client.commands[-1].order
+
+        # Act
+        self._fill(close_order, self.secondary_account_id, "2")
+
+        # Assert
+        position = self.cache.position(position_id)
+        assert position.is_closed
+        assert self.cache.positions_open(instrument_id=AUDUSD_SIM.id) == []
+
+    def test_fill_for_other_account_is_not_applied_to_position(self) -> None:
+        # Arrange
+        order1 = self._market_order()
+        self._submit(order1)
+        self._fill(order1, self.primary_account_id, "1")
+        position_id = PositionId(f"{AUDUSD_SIM.id}-{self.strategy.id}")
+
+        # Pin a second order to the primary position, but fill it on the secondary account
+        order2 = self._market_order()
+        self._submit(order2, position_id=position_id)
+
+        # Act
+        self._fill(order2, self.secondary_account_id, "2")
+
+        # Assert
+        position = self.cache.position(position_id)
+        assert position.account_id == self.primary_account_id
+        assert position.quantity == Quantity.from_int(100_000)
+
+    def test_oms_type_resolved_from_fill_account_client(self) -> None:
+        # Arrange
+        msgbus = MessageBus(trader_id=self.trader_id, clock=self.clock)
+        cache = Cache(database=MockCacheDatabase())
+        engine = ExecutionEngine(msgbus=msgbus, cache=cache, clock=self.clock)
+        hedging_client = MockExecutionClient(
+            client_id=ClientId("SIM"),
+            venue=self.venue,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            msgbus=msgbus,
+            cache=cache,
+            clock=self.clock,
+            oms_type=OmsType.HEDGING,
+        )
+        netting_client = MockExecutionClient(
+            client_id=ClientId("SIM3"),
+            venue=self.venue,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            msgbus=msgbus,
+            cache=cache,
+            clock=self.clock,
+            oms_type=OmsType.NETTING,
+        )
+        engine.register_client(hedging_client)
+        engine.register_client(netting_client)
+        order = self._market_order()
+        order.apply(TestEventStubs.order_submitted(order, account_id=AccountId("SIM3-001")))
+        order.apply(TestEventStubs.order_accepted(order, account_id=AccountId("SIM3-001")))
+        fill = TestEventStubs.order_filled(order, AUDUSD_SIM, account_id=AccountId("SIM3-001"))
+        primary_fill = TestEventStubs.order_filled(
+            order,
+            AUDUSD_SIM,
+            account_id=self.primary_account_id,
+        )
+
+        # Act, Assert
+        assert engine._determine_oms_type(fill) == OmsType.NETTING
+        assert engine._determine_oms_type(primary_fill) == OmsType.HEDGING
+
+    def test_submit_order_with_secondary_netting_position_id_is_accepted(self) -> None:
+        # Arrange
+        order = self._market_order()
+        position_id = PositionId(f"{AUDUSD_SIM.id}-{self.strategy.id}-SIM2")
+
+        # Act
+        self._submit(order, client_id=ClientId("SIM2"), position_id=position_id)
+
+        # Assert
+        assert order.status == OrderStatus.INITIALIZED
+        assert self.secondary_client.calls == ["_start", "submit_order"]
+
+    def test_submit_order_with_primary_netting_position_id_to_secondary_is_denied(self) -> None:
+        # Arrange
+        order = self._market_order()
+        position_id = PositionId(f"{AUDUSD_SIM.id}-{self.strategy.id}")
+
+        # Act
+        self._submit(order, client_id=ClientId("SIM2"), position_id=position_id)
+
+        # Assert
+        assert order.status == OrderStatus.DENIED
+        assert self.secondary_client.calls == ["_start"]
+
+    def test_cancel_all_orders_without_client_id_is_sent_to_all_venue_clients(self) -> None:
+        # Arrange
+        command = CancelAllOrders(
+            trader_id=self.trader_id,
+            strategy_id=self.strategy.id,
+            instrument_id=AUDUSD_SIM.id,
+            order_side=OrderSide.NO_ORDER_SIDE,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.exec_engine.execute(command)
+
+        # Assert
+        assert self.primary_client.calls == ["_start", "cancel_all_orders"]
+        assert self.secondary_client.calls == ["_start", "cancel_all_orders"]
+
+    def test_cancel_all_orders_with_client_id_is_sent_to_that_client(self) -> None:
+        # Arrange
+        command = CancelAllOrders(
+            trader_id=self.trader_id,
+            strategy_id=self.strategy.id,
+            instrument_id=AUDUSD_SIM.id,
+            order_side=OrderSide.NO_ORDER_SIDE,
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+            client_id=ClientId("SIM2"),
+        )
+
+        # Act
+        self.exec_engine.execute(command)
+
+        # Assert
+        assert self.primary_client.calls == ["_start"]
+        assert self.secondary_client.calls == ["_start", "cancel_all_orders"]
+
+    def test_batch_cancel_orders_without_client_id_is_split_by_client(self) -> None:
+        # Arrange
+        order1 = self._market_order()
+        order2 = self._market_order()
+        order3 = self._market_order()
+        self._submit(order1)
+        self._submit(order2, client_id=ClientId("SIM2"))
+        self._submit(order3, client_id=ClientId("SIM2"))
+        command = BatchCancelOrders(
+            trader_id=self.trader_id,
+            strategy_id=self.strategy.id,
+            instrument_id=AUDUSD_SIM.id,
+            cancels=[self._cancel_order(o) for o in (order1, order2, order3)],
+            command_id=UUID4(),
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.exec_engine.execute(command)
+
+        # Assert
+        primary_batch = self.primary_client.commands[-1]
+        secondary_batch = self.secondary_client.commands[-1]
+        assert isinstance(primary_batch, BatchCancelOrders)
+        assert isinstance(secondary_batch, BatchCancelOrders)
+        assert [c.client_order_id for c in primary_batch.cancels] == [order1.client_order_id]
+        assert [c.client_order_id for c in secondary_batch.cancels] == [
+            order2.client_order_id,
+            order3.client_order_id,
+        ]
+        assert primary_batch.client_id == ClientId("SIM")
+        assert secondary_batch.client_id == ClientId("SIM2")

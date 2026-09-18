@@ -541,9 +541,13 @@ class TestBinanceSpotExecutionClient:
             price=Price.from_str("3000.00"),
         )
         self.cache.add_order(limit_order, None)
-        limit_order.apply(TestEventStubs.order_submitted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_submitted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
-        limit_order.apply(TestEventStubs.order_accepted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_accepted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
 
         command = CancelAllOrders(
@@ -581,7 +585,9 @@ class TestBinanceSpotExecutionClient:
             price=Price.from_str("3000.00"),
         )
         self.cache.add_order(limit_order, None)
-        limit_order.apply(TestEventStubs.order_submitted(limit_order))
+        limit_order.apply(
+            TestEventStubs.order_submitted(limit_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(limit_order)
 
         command = CancelAllOrders(
@@ -625,9 +631,13 @@ class TestBinanceSpotExecutionClient:
             price=Price.from_str("3000.00"),
         )
         self.cache.add_order(strategy_order, None)
-        strategy_order.apply(TestEventStubs.order_submitted(strategy_order))
+        strategy_order.apply(
+            TestEventStubs.order_submitted(strategy_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(strategy_order)
-        strategy_order.apply(TestEventStubs.order_accepted(strategy_order))
+        strategy_order.apply(
+            TestEventStubs.order_accepted(strategy_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(strategy_order)
 
         other_strategy = Strategy(config=StrategyConfig(strategy_id="other"))
@@ -645,9 +655,13 @@ class TestBinanceSpotExecutionClient:
             price=Price.from_str("3100.00"),
         )
         self.cache.add_order(other_order, None)
-        other_order.apply(TestEventStubs.order_submitted(other_order))
+        other_order.apply(
+            TestEventStubs.order_submitted(other_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(other_order)
-        other_order.apply(TestEventStubs.order_accepted(other_order))
+        other_order.apply(
+            TestEventStubs.order_accepted(other_order, account_id=self.exec_client.account_id),
+        )
         self.cache.update_order(other_order)
 
         command = CancelAllOrders(

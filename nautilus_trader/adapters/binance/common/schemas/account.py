@@ -24,6 +24,7 @@ from nautilus_trader.adapters.binance.common.enums import BinanceOrderSide
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderStatus
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderType
 from nautilus_trader.adapters.binance.common.enums import BinanceTimeInForce
+from nautilus_trader.adapters.binance.common.positions import make_venue_position_id
 from nautilus_trader.core.datetime import millis_to_nanos
 from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.core.uuid import UUID4
@@ -101,7 +102,11 @@ class BinanceUserTrade(msgspec.Struct, frozen=True):
         venue_position_id: PositionId | None = None
 
         if self.positionSide is not None and use_position_ids:
-            venue_position_id = PositionId(f"{instrument_id}-{self.positionSide}")
+            venue_position_id = make_venue_position_id(
+                instrument_id,
+                self.positionSide,
+                account_id,
+            )
 
         order_side = OrderSide.BUY if self.isBuyer or self.buyer else OrderSide.SELL
         liquidity_side = LiquiditySide.MAKER if self.isMaker or self.maker else LiquiditySide.TAKER

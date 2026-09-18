@@ -145,6 +145,7 @@ cdef class ExecutionEngine(Component):
 
         self._clients: dict[ClientId, ExecutionClient] = {}
         self._routing_map: dict[Venue, ExecutionClient] = {}
+        self._secondary_clients: dict[ClientId, Venue] = {}
         self._default_client: ExecutionClient | None = None
         self._external_clients: set[ClientId] = set((config.external_clients or []))
         self._oms_overrides: dict[StrategyId, OmsType] = {}
@@ -384,15 +385,20 @@ cdef class ExecutionEngine(Component):
             ClientId client_id
             Venue venue
             ExecutionClient client
+        cdef set[ExecutionClient] clients = set()
         for order in orders:
-            venues.add(order.venue)
             client_id = self._cache.client_id(order.client_order_id)
-            if client_id is None:
+            if client_id is not None:
+                client_ids.add(client_id)
                 continue
 
-            client_ids.add(client_id)
+            client = self._client_for_account(order.account_id)
+            if client is not None:
+                clients.add(client)
+                continue
 
-        cdef set[ExecutionClient] clients = set()
+            venues.add(order.venue)
+
         for client_id in client_ids:
             clients.add(self._clients[client_id])
 
@@ -424,6 +430,12 @@ cdef class ExecutionEngine(Component):
         If the `client.venue` is ``None`` and a default routing client has not
         been previously registered then will be registered as such.
 
+        If a client is already registered for the `client.venue`, then the given
+        client is registered as an additional (secondary) client for the venue.
+        The first client keeps the venue routing; commands reach a secondary
+        client through an explicit `client_id`, or through the account ID of the
+        order or position the command refers to.
+
         Parameters
         ----------
         client : ExecutionClient
@@ -454,12 +466,13 @@ cdef class ExecutionEngine(Component):
         else:
             if client.venue in self._routing_map:
                 existing = self._routing_map[client.venue]
-                raise ValueError(
-                    f"Execution client for venue {client.venue!r} "
-                    f"already registered ({existing.id!r})"
+                self._secondary_clients[client.id] = client.venue
+                routing_log = (
+                    f" as additional client for {client.venue!r} "
+                    f"(venue routing remains with {existing.id!r})"
                 )
-
-            self._routing_map[client.venue] = client
+            else:
+                self._routing_map[client.venue] = client
 
         # Finally register in client registry
         self._clients[client.id] = client
@@ -505,6 +518,9 @@ cdef class ExecutionEngine(Component):
 
         if client.id not in self._clients:
             self._clients[client.id] = client
+
+        if self._secondary_clients.get(client.id) == venue:
+            del self._secondary_clients[client.id]
 
         self._routing_map[venue] = client
 
@@ -584,6 +600,7 @@ cdef class ExecutionEngine(Component):
 
         # Remove client from registry
         del self._clients[client.id]
+        self._secondary_clients.pop(client.id, None)
 
         # Clear default routing client if it matches
         if self._default_client is not None and self._default_client == client:
@@ -1062,35 +1079,65 @@ cdef class ExecutionEngine(Component):
     cpdef ExecutionClient _find_client_for_command(self, Command command):
         # Routing priority:
         # 1. Explicit client_id in command
-        # 2. Account_id issuer (for QueryAccount or orders with account_id set)
-        # 3. Venue-based routing (for single-venue brokers)
-        # 4. Default client (fallback)
+        # 2. Client the order was routed to (for commands referencing a cached order)
+        # 3. Account_id issuer (for QueryAccount, orders with account_id set,
+        #    or orders targeting an existing position)
+        # 4. Venue-based routing (for single-venue brokers)
+        # 5. Default client (fallback)
 
         cdef ExecutionClient client = None
         cdef AccountId account_id = None
-        cdef Order order
+        cdef ClientId cached_client_id = None
+        cdef Order order = None
+        cdef Position position = None
+        cdef PositionId position_id = None
+
+        cdef bint is_order_command = isinstance(command, (ModifyOrder, CancelOrder, QueryOrder))
 
         # 1. Try to get client by explicit client_id
-        if command.client_id is not None:
+        # (`CancelOrder` and `QueryOrder` default a missing client_id to the venue,
+        # which is not treated as explicit so the order's own client is resolved first)
+        if command.client_id is not None and not (
+            is_order_command
+            and command.client_id.value == command.instrument_id.venue.value
+        ):
             client = self._clients.get(command.client_id)
             if client is not None:
                 self._log.debug(f"Routed by explicit client_id: {command.client_id}")
                 return client
 
-        # 2. Try routing by account_id issuer
+        # 2. Try routing by the client of a previously routed order
+        if is_order_command:
+            cached_client_id = self._cache.client_id(command.client_order_id)
+            if cached_client_id is not None:
+                client = self._clients.get(cached_client_id)
+                if client is not None:
+                    self._log.debug(f"Routed by cached client_id: {cached_client_id}")
+                    return client
+
+        # 3. Try routing by account_id issuer
         if isinstance(command, QueryAccount):
             account_id = command.account_id
         elif isinstance(command, SubmitOrder):
             account_id = command.order.account_id
-        elif isinstance(command, (ModifyOrder, CancelOrder)):
-            # ModifyOrder/CancelOrder doesn't have order directly, need to get from cache
+            position_id = command.position_id
+        elif isinstance(command, SubmitOrderList):
+            position_id = command.position_id
+        elif isinstance(command, (ModifyOrder, CancelOrder, QueryOrder)):
+            # These commands don't have the order directly, need to get from cache
             order = self._cache.order(command.client_order_id)
             if order is not None:
                 account_id = order.account_id
 
+        if account_id is None and position_id is not None:
+            # Orders targeting an existing position route to the position's account
+            position = self._cache.position(position_id)
+            if position is not None:
+                account_id = position.account_id
+
         if account_id is not None:
             # Try to find client by account_id issuer (as ClientId)
-            client = self._clients.get(ClientId(account_id.get_issuer()))
+            client = self._client_for_account(account_id)
             if client is not None:
                 self._log.debug(f"Routed by account_id issuer: {account_id.get_issuer()}")
                 return client
@@ -1101,19 +1148,75 @@ cdef class ExecutionEngine(Component):
                 self._log.debug(f"Routed by venue (account issuer): {account_id.get_issuer()}")
                 return client
 
-        # 3. Fall back to venue-based routing (for single-venue brokers)
+        # Venue default client_id of an order command (see step 1)
+        if command.client_id is not None and is_order_command:
+            client = self._clients.get(command.client_id)
+            if client is not None:
+                self._log.debug(f"Routed by client_id: {command.client_id}")
+                return client
+
+        # 4. Fall back to venue-based routing (for single-venue brokers)
         if isinstance(command, TradingCommand):
             client = self._routing_map.get(command.instrument_id.venue)
             if client is not None:
                 self._log.debug(f"Routed by instrument venue: {command.instrument_id.venue}")
                 return client
 
-        # 4. Final fallback to default client
+        # 5. Final fallback to default client
         client = self._default_client
         if client is not None:
             self._log.debug(f"Routed by default client: {client.id}")
 
         return client
+
+    cdef ExecutionClient _client_for_account(self, AccountId account_id):
+        if account_id is None:
+            return None
+
+        return self._clients.get(ClientId(account_id.get_issuer()))
+
+    cdef ExecutionClient _client_for_order(self, Order order):
+        cdef ClientId client_id = self._cache.client_id(order.client_order_id)
+        cdef ExecutionClient client = None
+        if client_id is not None:
+            client = self._clients.get(client_id)
+            if client is not None:
+                return client
+
+        client = self._client_for_account(order.account_id)
+        if client is not None:
+            return client
+
+        return self._routing_map.get(order.instrument_id.venue, self._default_client)
+
+    cdef list _clients_for_venue(self, Venue venue):
+        # Returns the venue routing client followed by any secondary clients for the venue
+        cdef list clients = []
+        cdef ExecutionClient client = self._routing_map.get(venue)
+        if client is not None:
+            clients.append(client)
+
+        cdef ClientId client_id
+        cdef Venue secondary_venue
+        for client_id, secondary_venue in self._secondary_clients.items():
+            if secondary_venue == venue:
+                clients.append(self._clients[client_id])
+
+        return clients
+
+    cdef str _netting_position_id_str(
+        self,
+        InstrumentId instrument_id,
+        StrategyId strategy_id,
+        ClientId client_id,
+    ):
+        # Positions for secondary (additional) clients of a venue are suffixed
+        # with the client ID so that NETTING positions for the same instrument
+        # and strategy remain separate per account.
+        if client_id is not None and client_id in self._secondary_clients:
+            return f"{instrument_id}-{strategy_id}-{client_id}"
+
+        return f"{instrument_id}-{strategy_id}"
 
     cpdef void _handle_submit_order(self, ExecutionClient client, SubmitOrder command):
         cdef Order order = command.order
@@ -1205,7 +1308,11 @@ cdef class ExecutionEngine(Component):
         if oms_type != OmsType.NETTING:
             return None
 
-        cdef str expected = f"{instrument_id}-{strategy_id}"
+        cdef str expected = self._netting_position_id_str(
+            instrument_id,
+            strategy_id,
+            client.id if client is not None else None,
+        )
         if position_id.to_str() == expected:
             return None
 
@@ -1229,10 +1336,57 @@ cdef class ExecutionEngine(Component):
         client.cancel_order(command)
 
     cpdef void _handle_cancel_all_orders(self, ExecutionClient client, CancelAllOrders command):
-        client.cancel_all_orders(command)
+        if command.client_id is not None:
+            client.cancel_all_orders(command)
+            return
+
+        # Without an explicit client, cancel with every client for the venue
+        # (each client cancels the orders of its own account)
+        cdef list clients = self._clients_for_venue(command.instrument_id.venue)
+        if client not in clients:
+            clients.insert(0, client)
+
+        cdef ExecutionClient venue_client
+        for venue_client in clients:
+            venue_client.cancel_all_orders(command)
 
     cpdef void _handle_batch_cancel_orders(self, ExecutionClient client, BatchCancelOrders command):
-        client.batch_cancel_orders(command)
+        if command.client_id is not None or not self._secondary_clients:
+            client.batch_cancel_orders(command)
+            return
+
+        # Without an explicit client, split the cancels by the client each order was routed to
+        cdef dict cancels_by_client = {}  # type: dict[ExecutionClient, list[CancelOrder]]
+        cdef CancelOrder cancel
+        cdef Order order
+        cdef ExecutionClient order_client
+        for cancel in command.cancels:
+            order = self._cache.order(cancel.client_order_id)
+            order_client = self._client_for_order(order) if order is not None else None
+            if order_client is None:
+                order_client = client
+
+            cancels_by_client.setdefault(order_client, []).append(cancel)
+
+        if len(cancels_by_client) == 1 and client in cancels_by_client:
+            client.batch_cancel_orders(command)
+            return
+
+        cdef list cancels
+        for order_client, cancels in cancels_by_client.items():
+            order_client.batch_cancel_orders(
+                BatchCancelOrders(
+                    trader_id=command.trader_id,
+                    strategy_id=command.strategy_id,
+                    instrument_id=command.instrument_id,
+                    cancels=cancels,
+                    command_id=UUID4(),
+                    ts_init=command.ts_init,
+                    client_id=order_client.id,
+                    params=command.params,
+                    correlation_id=command.correlation_id,
+                )
+            )
 
     cpdef void _handle_query_account(self, ExecutionClient client, QueryAccount command):
         client.query_account(command)
@@ -1443,10 +1597,21 @@ cdef class ExecutionEngine(Component):
         )
 
     cpdef OmsType _determine_oms_type(self, OrderFilled fill):
-        cdef ExecutionClient client = self._routing_map.get(
-            fill.instrument_id.venue,
-            self._default_client,
-        )
+        # Resolve the client for the fill's account first, so that each client
+        # of a venue applies its own OMS type
+        cdef ExecutionClient client = self._client_for_account(fill.account_id)
+        cdef ClientId client_id = None
+        if client is None:
+            client_id = self._cache.client_id(fill.client_order_id)
+            if client_id is not None:
+                client = self._clients.get(client_id)
+
+        if client is None:
+            client = self._routing_map.get(
+                fill.instrument_id.venue,
+                self._default_client,
+            )
+
         return self._resolve_oms_type(fill.strategy_id, client)
 
     cpdef void _determine_position_id(self, OrderFilled fill, OmsType oms_type, Order order=None):
@@ -1559,7 +1724,13 @@ cdef class ExecutionEngine(Component):
         return position_id
 
     cpdef PositionId _determine_netting_position_id(self, OrderFilled fill):
-        return PositionId(f"{fill.instrument_id}-{fill.strategy_id}")
+        cdef ClientId client_id = None
+        if fill.account_id is not None:
+            client_id = ClientId(fill.account_id.get_issuer())
+
+        return PositionId(
+            self._netting_position_id_str(fill.instrument_id, fill.strategy_id, client_id),
+        )
 
     cdef bint _check_overfill(self, Order order, OrderFilled fill):
         cdef Quantity potential_overfill = order.calculate_overfill_c(fill.last_qty)
@@ -1688,6 +1859,14 @@ cdef class ExecutionEngine(Component):
 
     cdef void _handle_position_update(self, Instrument instrument, OrderFilled fill, OmsType oms_type):
         cdef Position position = self._cache.position(fill.position_id)
+        if position is not None and position.account_id != fill.account_id:
+            # Guard against applying a fill from one account to another account's position
+            self._log.error(
+                f"Cannot apply fill {fill.trade_id!r} for {fill.account_id!r} "
+                f"to {position.id!r} of {position.account_id!r}: account mismatch",
+            )
+            return
+
         if position is None or position.is_closed_c():
             if self._reject_reduce_only_netting_position_open(fill, oms_type):
                 return

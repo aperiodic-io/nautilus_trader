@@ -1356,6 +1356,59 @@ node.add_exec_client_factory(OKX, OKXLiveExecClientFactory)
 node.build()
 ```
 
+## Multiple accounts
+
+The legacy v1 adapter can trade several OKX accounts (separate API keys) from one
+`TradingNode`. Each account runs its own execution client; one data client serves market data
+for all of them.
+
+1. Keep the key `OKX` for the primary account. It keeps venue routing, so orders submitted
+   without a `client_id` go to it, and its account and position IDs are unchanged.
+2. Give each additional account a distinct key without a hyphen, such as `OKXB`. The node
+   builder only uses the part of a key before the first `-`, and the key becomes the client ID
+   and the account ID issuer (for example `OKXB-master`).
+3. Register the execution client factory under each key.
+4. Set `api_key`, `api_secret`, and `api_passphrase` explicitly for each additional account.
+   The environment variable fallback resolves a single set of credentials.
+
+```python
+config = TradingNodeConfig(
+    ...,
+    data_clients={
+        OKX: OKXDataClientConfig(instrument_types=(OKXInstrumentType.SWAP,)),
+    },
+    exec_clients={
+        OKX: OKXExecClientConfig(
+            api_key=None,  # Will use OKX_API_KEY env var
+            api_secret=None,  # Will use OKX_API_SECRET env var
+            api_passphrase=None,  # Will use OKX_API_PASSPHRASE env var
+            instrument_types=(OKXInstrumentType.SWAP,),
+        ),
+        "OKXB": OKXExecClientConfig(
+            api_key=account_b_api_key,
+            api_secret=account_b_api_secret,
+            api_passphrase=account_b_api_passphrase,
+            instrument_types=(OKXInstrumentType.SWAP,),
+        ),
+    },
+)
+node = TradingNode(config=config)
+node.add_data_client_factory(OKX, OKXLiveDataClientFactory)
+node.add_exec_client_factory(OKX, OKXLiveExecClientFactory)
+node.add_exec_client_factory("OKXB", OKXLiveExecClientFactory)
+node.build()
+```
+
+In the strategy, pass the client ID of an additional account when submitting orders:
+
+```python
+self.submit_order(order, client_id=ClientId("OKXB"))
+```
+
+Modify, cancel, and close commands route to the account of the order or position they refer
+to. For more on routing, positions, and account queries with several accounts per venue, see
+[Multiple accounts per venue](../concepts/execution.md#multiple-accounts-per-venue).
+
 ## Contributing
 
 :::info

@@ -1149,6 +1149,7 @@ cdef class Order:
         self.ts_closed = event.ts_event
 
     cdef void _accepted(self, OrderAccepted event):
+        self.account_id = event.account_id  # Set for orders accepted without submission (external)
         self.venue_order_id = event.venue_order_id
         self.ts_accepted = event.ts_event
 
