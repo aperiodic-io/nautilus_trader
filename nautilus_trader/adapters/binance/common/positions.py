@@ -22,13 +22,17 @@ def make_venue_position_id(
     instrument_id: InstrumentId,
     position_side: str,
     account_id: AccountId,
+    is_multi_account: bool,
 ) -> PositionId:
     """
     Return the venue position ID for a Binance Futures hedge mode position.
 
-    Where the account is not the primary account for the venue (its issuer differs from
-    the venue), the ID is suffixed with the issuer so that the positions of multiple
-    accounts for the same instrument and side remain distinct.
+    Where the venue has more than one account, the ID is suffixed with the account's
+    issuer so that the positions of multiple accounts for the same instrument and side
+    remain distinct. A venue with a single account never gets a suffix, whatever that
+    one client happens to be named (`is_multi_account` reflects the venue's actual
+    client count, from `ExecutionClient.is_multi_account_venue`, rather than comparing
+    the account issuer to the venue's name).
 
     Parameters
     ----------
@@ -38,14 +42,16 @@ def make_venue_position_id(
         The Binance position side (LONG or SHORT).
     account_id : AccountId
         The account ID for the position.
+    is_multi_account : bool
+        If the venue currently has more than one account (execution client)
+        registered with the execution engine.
 
     Returns
     -------
     PositionId
 
     """
-    issuer = account_id.get_issuer()
-    if issuer == instrument_id.venue.value:
+    if not is_multi_account:
         return PositionId(f"{instrument_id}-{position_side}")
 
-    return PositionId(f"{instrument_id}-{position_side}-{issuer}")
+    return PositionId(f"{instrument_id}-{position_side}-{account_id.get_issuer()}")

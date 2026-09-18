@@ -352,6 +352,7 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
                     instrument_id,
                     self.ps.value,
                     exec_client.account_id,
+                    exec_client.is_multi_account_venue,
                 )
             exec_client._send_order_status_report(report)
             return
@@ -411,6 +412,7 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
                     instrument_id,
                     self.ps.value,
                     exec_client.account_id,
+                    exec_client.is_multi_account_venue,
                 )
 
             # Note: We cannot use generate_order_filled without strategy_id and cached order
@@ -585,6 +587,7 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
                     instrument_id,
                     self.ps.value,
                     exec_client.account_id,
+                    exec_client.is_multi_account_venue,
                 )
 
             # Liquidations are always taker, regular trades use the 'm' field
@@ -1031,6 +1034,7 @@ class BinanceFuturesAlgoOrderData(msgspec.Struct, kw_only=True, frozen=True):
                 instrument_id,
                 self.ps.value,
                 exec_client.account_id,
+                exec_client.is_multi_account_venue,
             )
 
         exec_client.generate_order_filled(

@@ -146,6 +146,12 @@ cdef class ExecutionEngine(Component):
         self._clients: dict[ClientId, ExecutionClient] = {}
         self._routing_map: dict[Venue, ExecutionClient] = {}
         self._venue_clients: dict[Venue, list[ExecutionClient]] = {}
+        # Every client ID ever registered, kept after deregistration. Distinguishes a
+        # detached account's client_id (known, but no longer available - never
+        # substitute a different client for it) from an account_id that was never a
+        # registered client at all (a venue or default client fallback may apply, as
+        # for example with an IB account_id that is not itself a client_id).
+        self._ever_registered_clients: set[ClientId] = set()
         self._default_client: ExecutionClient | None = None
         self._external_clients: set[ClientId] = set((config.external_clients or []))
         self._oms_overrides: dict[StrategyId, OmsType] = {}
@@ -501,6 +507,9 @@ cdef class ExecutionEngine(Component):
         ValueError
             If the venue would have multiple clients and one of them is named after
             the venue (there is no default account for a venue).
+        ValueError
+            If the venue would have multiple clients and an unscoped (bare) external
+            order claim is already registered for one of its instruments.
 
         """
         Condition.not_none(client, "client")
@@ -541,6 +550,25 @@ cdef class ExecutionEngine(Component):
                         f"'{client.venue}1', '{client.venue}2')"
                     )
 
+                # A venue with multiple accounts has no default account, so an unscoped
+                # (bare) external order claim already registered for one of its instruments
+                # could never apply from this point on; catch that now rather than let it
+                # silently stop working the moment this second client attaches (F4).
+                bare_claims = []
+                for claim_instrument_id, claim_value in self._external_order_claims_any.items():
+                    if claim_instrument_id.venue == client.venue and not claim_value[1]:
+                        bare_claims.append(f"{claim_instrument_id} (claimed by {claim_value[0]})")
+
+                if bare_claims:
+                    raise ValueError(
+                        f"Cannot register {client.id!r}: venue {client.venue!r} would have "
+                        f"multiple clients, but has unscoped external order claims that "
+                        f"would no longer have a default account to apply to: "
+                        f"{', '.join(bare_claims)}. Use '<INSTRUMENT>@<CLIENT_ID>' to scope "
+                        "each claim to one account, or '<INSTRUMENT>@*' to claim it for every "
+                        "account of the venue."
+                    )
+
                 # A venue with multiple accounts has no venue routing
                 venue_clients.append(client)
                 self._routing_map.pop(client.venue, None)
@@ -551,6 +579,10 @@ cdef class ExecutionEngine(Component):
 
         # Finally register in client registry
         self._clients[client.id] = client
+        self._ever_registered_clients.add(client.id)
+
+        if client.venue is not None:
+            self._sync_multi_account_venue_flag(client.venue)
 
         self._log.info(f"Registered ExecutionClient-{client}{routing_log}")
 
@@ -651,6 +683,9 @@ cdef class ExecutionEngine(Component):
         InvalidConfiguration
             If a claim conflicts with a claim already registered for that instrument
             (and, for account-scoped claims, that account).
+        InvalidConfiguration
+            If an unscoped (bare) claim is registered for an instrument whose venue
+            already has multiple accounts (no default account for the claim to apply to).
 
         """
         Condition.not_none(strategy, "strategy")
@@ -701,11 +736,66 @@ cdef class ExecutionEngine(Component):
                             f"registered for {self._external_order_claims_scoped[key]}",
                         )
 
+                if not wildcard and self._is_multi_account_venue(instrument_id.venue):
+                    raise InvalidConfiguration(
+                        f"External order claim for {instrument_id} by {strategy.id} is "
+                        f"unscoped, but {instrument_id.venue} already has multiple accounts "
+                        "(no default account) so the claim can never apply. Use "
+                        f"'{instrument_id}@<CLIENT_ID>' to claim orders for one account, or "
+                        f"'{instrument_id}@*' to claim orders for every account of the venue.",
+                    )
+
                 self._external_order_claims_any[instrument_id] = (strategy.id, wildcard)
 
         if claims:
             self._log.info(
                 f"Registered external order claims for {strategy}: {claims}",
+            )
+
+    cpdef void deregister_external_order_claims(self, Strategy strategy):
+        """
+        Deregister the given strategies external order claims (if any).
+
+        This removes every claim (account-scoped, wildcard, or unscoped) previously
+        registered for the strategy, freeing the covered (instrument, account) pairs so
+        another registration of `register_external_order_claims` (for this strategy or
+        any other) for the same claim does not raise `InvalidConfiguration`. This is
+        the counterpart to `register_external_order_claims` and must be called when a
+        strategy is removed, so that re-adding a strategy with the same stable ID (for
+        example after a session retry, or an account being detached and re-attached)
+        does not find its own prior claim still registered.
+
+        Parameters
+        ----------
+        strategy : Strategy
+            The strategy to deregister claims for.
+
+        """
+        Condition.not_none(strategy, "strategy")
+
+        cdef list scoped_keys_to_remove = []
+        cdef tuple scoped_key
+        cdef StrategyId scoped_strategy_id
+        for scoped_key, scoped_strategy_id in self._external_order_claims_scoped.items():
+            if scoped_strategy_id == strategy.id:
+                scoped_keys_to_remove.append(scoped_key)
+
+        for scoped_key in scoped_keys_to_remove:
+            del self._external_order_claims_scoped[scoped_key]
+
+        cdef list any_instruments_to_remove = []
+        cdef InstrumentId any_instrument_id
+        cdef tuple any_value
+        for any_instrument_id, any_value in self._external_order_claims_any.items():
+            if any_value[0] == strategy.id:
+                any_instruments_to_remove.append(any_instrument_id)
+
+        for any_instrument_id in any_instruments_to_remove:
+            del self._external_order_claims_any[any_instrument_id]
+
+        if scoped_keys_to_remove or any_instruments_to_remove:
+            self._log.info(
+                f"Deregistered external order claims for {strategy}",
             )
 
     cpdef void deregister_client(self, ExecutionClient client):
@@ -753,7 +843,23 @@ cdef class ExecutionEngine(Component):
             else:
                 del self._venue_clients[client.venue]
 
+            self._sync_multi_account_venue_flag(client.venue)
+
+        client._set_multi_account_venue(False)
+
         self._log.info(f"Deregistered {client}")
+
+    cdef void _sync_multi_account_venue_flag(self, Venue venue):
+        # Tell every currently registered client of a venue whether that venue now
+        # has more than one account, so adapters can decide whether venue-reported
+        # identifiers (for example a hedge-mode position ID) need an account
+        # suffix, without depending on whether a client happens to be named after
+        # the venue.
+        cdef list venue_clients = self._venue_clients.get(venue, [])
+        cdef bint is_multi_account = len(venue_clients) > 1
+        cdef ExecutionClient venue_client
+        for venue_client in venue_clients:
+            venue_client._set_multi_account_venue(is_multi_account)
 
     # -- RECONCILIATION -------------------------------------------------------------------------------
 
@@ -1259,6 +1365,7 @@ cdef class ExecutionEngine(Component):
         cdef Order order = None
         cdef Position position = None
         cdef PositionId position_id = None
+        cdef bint known_account_unavailable = False
 
         cdef bint is_order_command = isinstance(command, (ModifyOrder, CancelOrder, QueryOrder))
 
@@ -1282,6 +1389,11 @@ cdef class ExecutionEngine(Component):
                 if client is not None:
                     self._log.debug(f"Routed by cached client_id: {cached_client_id}")
                     return client
+
+                # This order was pinned to a specific client that is no longer
+                # registered (for example its account was detached): never
+                # substitute a different client for it
+                known_account_unavailable = True
 
         # 3. Try routing by account_id issuer
         if isinstance(command, QueryAccount):
@@ -1318,6 +1430,20 @@ cdef class ExecutionEngine(Component):
             if client is not None:
                 self._log.debug(f"Routed by venue (account issuer): {account_id.get_issuer()}")
                 return client
+
+            # If the issuer was itself a registered client at some point (rather than,
+            # for example, an IB account_id that was never a client_id), this command
+            # belongs to a known account with no client currently serving it: never
+            # substitute a different account's client, even a venue's sole remaining one
+            if ClientId(account_id.get_issuer()) in self._ever_registered_clients:
+                known_account_unavailable = True
+
+        if known_account_unavailable:
+            self._log.debug(
+                "No client serves the account this command belongs to; not falling "
+                "back to venue or default routing",
+            )
+            return None
 
         # Venue default client_id of an order command (see step 1)
         if command.client_id is not None and is_order_command:
@@ -1364,26 +1490,39 @@ cdef class ExecutionEngine(Component):
     cpdef ExecutionClient _client_for_order(self, Order order):
         # Resolve the client an order belongs to: the client it was routed to, then
         # the client of its account, then the account of the position it targets,
-        # and finally venue routing
+        # and finally venue routing. If the order is positively tied to a known
+        # account (by cached client_id, its own account_id, or its position's
+        # account) but no client currently serves that account, never substitute a
+        # different account's client - not even a venue's sole remaining one.
         cdef ClientId client_id = self._cache.client_id(order.client_order_id)
         cdef ExecutionClient client = None
+        cdef bint known_account_unavailable = False
         if client_id is not None:
             client = self._clients.get(client_id)
             if client is not None:
                 return client
+            known_account_unavailable = True
 
-        client = self._client_for_account(order.account_id)
-        if client is not None:
-            return client
+        if order.account_id is not None:
+            client = self._client_for_account(order.account_id)
+            if client is not None:
+                return client
+            if ClientId(order.account_id.get_issuer()) in self._ever_registered_clients:
+                known_account_unavailable = True
 
         cdef PositionId position_id = self._cache.position_id(order.client_order_id)
         cdef Position position = None
         if position_id is not None:
             position = self._cache.position(position_id)
-            if position is not None:
+            if position is not None and position.account_id is not None:
                 client = self._client_for_account(position.account_id)
                 if client is not None:
                     return client
+                if ClientId(position.account_id.get_issuer()) in self._ever_registered_clients:
+                    known_account_unavailable = True
+
+        if known_account_unavailable:
+            return None
 
         return self._venue_client(order.instrument_id.venue)
 
@@ -1393,10 +1532,12 @@ cdef class ExecutionEngine(Component):
         StrategyId strategy_id,
         ClientId client_id,
     ):
-        # Positions of a venue client not named after the venue (an additional
-        # account) are suffixed with the client ID, so that NETTING positions for
-        # the same instrument and strategy remain separate per account. The rule
-        # depends only on the client ID, not on registration order.
+        # Positions of a client on a venue with more than one account are suffixed
+        # with the client ID, so that NETTING positions for the same instrument and
+        # strategy remain separate per account. The rule depends only on whether the
+        # venue currently has multiple accounts, not on registration order, and not
+        # on whether the client happens to be named after the venue: a venue's sole
+        # client is never suffixed, whatever it is named.
         cdef ExecutionClient client = None
         if client_id is not None:
             client = self._clients.get(client_id)
@@ -1404,7 +1545,7 @@ cdef class ExecutionEngine(Component):
         if (
             client is not None
             and client.venue is not None
-            and client.id.value != client.venue.value
+            and self._is_multi_account_venue(client.venue)
         ):
             return f"{instrument_id}-{strategy_id}-{client_id}"
 

@@ -171,6 +171,61 @@ class TestRiskEngineWithCashAccount:
         assert risk_engine.max_notionals_per_order() == {_GBPUSD_SIM.id: Decimal(2000000)}
         assert risk_engine.max_notional_per_order(_GBPUSD_SIM.id) == 2_000_000
 
+    def test_submit_order_to_freshly_attached_client_before_account_state_is_denied(self):
+        # Arrange - a fresh venue/client has registered but has not yet received its
+        # first account state (F9); this applies to a single-account venue too, not
+        # only a multi-account one
+        fresh_venue = Venue("SIM_FRESH")
+        fresh_client_id = ClientId(fresh_venue.value)
+
+        instrument = TestInstrumentProvider.default_fx_ccy("AUD/USD", fresh_venue)
+        self.cache.add_instrument(instrument)
+        self.cache.add_quote_tick(TestDataStubs.quote_tick(instrument=instrument))
+
+        fresh_client = MockExecutionClient(
+            client_id=fresh_client_id,
+            venue=fresh_venue,
+            account_type=AccountType.CASH,
+            base_currency=USD,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_client(fresh_client)
+        # No account state has been applied for fresh_venue yet
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        order = strategy.order_factory.market(
+            instrument.id,
+            OrderSide.BUY,
+            Quantity.from_int(10_000),
+        )
+
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=None,
+            order=order,
+            command_id=UUID4(),
+            client_id=fresh_client_id,
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+
+        # Assert - denied rather than silently passed through with no risk check
+        assert order.status == OrderStatus.DENIED
+        assert "ACCOUNT_NOT_FOUND" in order.last_event.reason
+
     def test_risk_engine_on_stop(self):
         # Arrange, Act
         self.risk_engine.start()

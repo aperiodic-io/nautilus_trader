@@ -137,6 +137,7 @@ cdef class ExecutionClient(Component):
         self.base_currency = base_currency
 
         self.is_connected = False
+        self.is_multi_account_venue = False
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}-{self.id.value}"
@@ -144,6 +145,10 @@ cdef class ExecutionClient(Component):
     cpdef void _set_connected(self, bint value=True):
         # Setter for Python implementations to change the readonly property
         self.is_connected = value
+
+    cpdef void _set_multi_account_venue(self, bint value):
+        # Called by the execution engine on registration and deregistration
+        self.is_multi_account_venue = value
 
     cpdef void _set_account_id(self, AccountId account_id):
         Condition.not_none(account_id, "account_id")

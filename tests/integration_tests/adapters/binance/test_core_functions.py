@@ -145,21 +145,29 @@ class TestBinanceCoreFunctions:
         assert account_type.is_futures == expected
 
     @pytest.mark.parametrize(
-        ("account_id", "expected"),
+        ("account_id", "is_multi_account", "expected"),
         [
-            # A single account named after the venue keeps the plain ID
-            ("BINANCE-USDT_FUTURES-master", "ETHUSDT-PERP.BINANCE-LONG"),
-            # Every account of a venue with multiple accounts is suffixed with its issuer
-            ("BINANCE1-USDT_FUTURES-master", "ETHUSDT-PERP.BINANCE-LONG-BINANCE1"),
-            ("BINANCE2-USDT_FUTURES-master", "ETHUSDT-PERP.BINANCE-LONG-BINANCE2"),
+            # A venue with a single account keeps the plain ID, whatever the client
+            # (and hence the account issuer) is named
+            ("BINANCE-USDT_FUTURES-master", False, "ETHUSDT-PERP.BINANCE-LONG"),
+            ("BINANCE1-USDT_FUTURES-master", False, "ETHUSDT-PERP.BINANCE-LONG"),
+            # Every account of a venue with multiple accounts is suffixed with its
+            # issuer, regardless of which one happens to be named after the venue
+            ("BINANCE1-USDT_FUTURES-master", True, "ETHUSDT-PERP.BINANCE-LONG-BINANCE1"),
+            ("BINANCE2-USDT_FUTURES-master", True, "ETHUSDT-PERP.BINANCE-LONG-BINANCE2"),
         ],
     )
-    def test_make_venue_position_id(self, account_id, expected):
+    def test_make_venue_position_id(self, account_id, is_multi_account, expected):
         # Arrange
         instrument_id = InstrumentId.from_str("ETHUSDT-PERP.BINANCE")
 
         # Act
-        result = make_venue_position_id(instrument_id, "LONG", AccountId(account_id))
+        result = make_venue_position_id(
+            instrument_id,
+            "LONG",
+            AccountId(account_id),
+            is_multi_account,
+        )
 
         # Assert
         assert result == PositionId(expected)
@@ -203,6 +211,7 @@ class TestBinanceCoreFunctions:
             InstrumentId.from_str("ETHUSDT-PERP.BINANCE"),
             position_side,
             AccountId("BINANCE2-USDT_FUTURES-master"),
+            True,
         )
 
         # Act

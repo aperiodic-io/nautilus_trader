@@ -180,6 +180,7 @@ class BinanceFuturesPositionRisk(msgspec.Struct, kw_only=True, frozen=True):
         enum_parser: BinanceFuturesEnumParser,
         report_id: UUID4,
         ts_init: int,
+        is_multi_account: bool = False,
     ) -> PositionStatusReport:
         net_size = Decimal(self.positionAmt)
 
@@ -198,6 +199,7 @@ class BinanceFuturesPositionRisk(msgspec.Struct, kw_only=True, frozen=True):
                 instrument_id,
                 self.positionSide.value,
                 account_id,
+                is_multi_account,
             )
         else:
             position_side = enum_parser.parse_futures_position_side(net_size)

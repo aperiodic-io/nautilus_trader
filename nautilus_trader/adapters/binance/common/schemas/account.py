@@ -98,6 +98,7 @@ class BinanceUserTrade(msgspec.Struct, frozen=True):
         report_id: UUID4,
         ts_init: int,
         use_position_ids: bool = True,
+        is_multi_account: bool = False,
     ) -> FillReport:
         venue_position_id: PositionId | None = None
 
@@ -106,6 +107,7 @@ class BinanceUserTrade(msgspec.Struct, frozen=True):
                 instrument_id,
                 self.positionSide,
                 account_id,
+                is_multi_account,
             )
 
         order_side = OrderSide.BUY if self.isBuyer or self.buyer else OrderSide.SELL

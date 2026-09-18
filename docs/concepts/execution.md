@@ -291,6 +291,15 @@ to, including the `REDUCING` trading state check. Portfolio and cache account lo
 return no account for a venue with multiple accounts; pass an `account_id`, for example
 `portfolio.account(account_id=AccountId("BINANCE2-USDT_FUTURES-master"))`.
 
+If a command names a `client_id` or targets a position whose account has not yet been resolved
+(for example immediately after that execution client attaches, before its first account state has
+been processed), the `RiskEngine` denies the order with an `ACCOUNT_NOT_FOUND` reason rather than
+passing it through with no balance or notional check. An order that does not target any specific
+account at all (no `client_id`, no `account_id`, and no execution client registered for the venue)
+still passes through the `RiskEngine` unchecked, so that downstream routing can deny it (for
+example with `AMBIGUOUS_ACCOUNT`) or a completely unconfigured venue can fail visibly further down
+the pipeline.
+
 Live reconciliation is scoped per account: a failed status query for one account does not cause
 the orders or positions of another account to be treated as missing, and fills are matched by
 account and trade ID, as both sides of a trade between two accounts share the venue trade ID.
@@ -309,10 +318,13 @@ issue clears. If every client fails, startup is aborted regardless of this setti
 ### External order claims on a multi-account venue
 
 `StrategyConfig.external_order_claims` also has no default account on a multi-account venue. A
-bare claim (`"ETHUSDT-PERP.BINANCE"`) is only applied automatically when the venue has a single
-account; on a venue with multiple accounts it is not applied (a warning is logged once), because
-claiming every account's external orders for one strategy is rarely what is intended. Scope the
-claim explicitly instead:
+bare claim (`"ETHUSDT-PERP.BINANCE"`) is only ever applied when the venue has a single account.
+Registering a bare claim for an instrument whose venue already has multiple accounts raises
+`InvalidConfiguration` immediately, and attaching a second account for a venue that already has a
+bare claim registered for one of its instruments raises `ValueError` and refuses to register that
+client. Either way the venue never silently drops a claim once a second account joins, because
+that would leave the claiming strategy's prior-attempt orders unclaimed on restart with nothing to
+cancel them. Scope the claim explicitly instead:
 
 - `"ETHUSDT-PERP.BINANCE@BINANCE2"` claims that instrument for the `BINANCE2` account only.
 - `"ETHUSDT-PERP.BINANCE@*"` claims it for every account of the venue (an explicit opt-in).

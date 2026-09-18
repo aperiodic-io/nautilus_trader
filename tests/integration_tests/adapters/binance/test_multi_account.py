@@ -160,6 +160,50 @@ class TestBinanceMultiAccountClients:
         assert self.first.venue not in self.exec_engine._routing_map
         assert self.exec_engine._venue_clients[self.first.venue] == [self.first, self.second]
 
+    def test_is_multi_account_venue_flag_is_set_on_both_clients(self):
+        # Assert - set by the engine on registration, not derived from client naming
+        assert self.first.is_multi_account_venue is True
+        assert self.second.is_multi_account_venue is True
+
+    def test_is_multi_account_venue_flag_clears_when_back_to_a_single_client(self):
+        # Act
+        self.exec_engine.deregister_client(self.first)
+
+        # Assert
+        assert self.second.is_multi_account_venue is False
+        assert self.first.is_multi_account_venue is False
+
+    def test_solo_client_named_after_venue_has_flag_false(self):
+        # Arrange
+        engine = ExecutionEngine(
+            msgbus=MessageBus(trader_id=self.trader_id, clock=self.clock),
+            cache=self.cache,
+            clock=self.clock,
+        )
+        solo = self._make_client("BINANCE", "SOLO_KEY")
+
+        # Act
+        engine.register_client(solo)
+
+        # Assert
+        assert solo.is_multi_account_venue is False
+
+    def test_solo_client_not_named_after_venue_has_flag_false(self):
+        # Arrange - naming the only client "BINANCE1" instead of "BINANCE" must not
+        # change whether venue-reported position IDs get suffixed
+        engine = ExecutionEngine(
+            msgbus=MessageBus(trader_id=self.trader_id, clock=self.clock),
+            cache=self.cache,
+            clock=self.clock,
+        )
+        solo = self._make_client("BINANCE1", "SOLO_KEY")
+
+        # Act
+        engine.register_client(solo)
+
+        # Assert
+        assert solo.is_multi_account_venue is False
+
     def test_active_symbols_scoped_to_client_account(self):
         # Arrange
         self.cache.add_instrument(BTCUSDT_BINANCE)
@@ -285,6 +329,7 @@ class TestBinanceMultiAccountPositionIds:
             enum_parser=BinanceFuturesEnumParser(),
             report_id=UUID4(),
             ts_init=0,
+            is_multi_account=True,
         )
 
         # Assert
@@ -314,6 +359,7 @@ class TestBinanceMultiAccountPositionIds:
                     enum_parser=BinanceFuturesEnumParser(),
                     report_id=UUID4(),
                     ts_init=0,
+                    is_multi_account=True,
                 ),
             )
 

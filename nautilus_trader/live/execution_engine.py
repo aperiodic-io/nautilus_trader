@@ -738,6 +738,17 @@ class LiveExecutionEngine(ExecutionEngine):
                 self._clear_recon_tracking(order.client_order_id, drop_last_query=False)
                 continue
 
+            if self._client_for_order(order) is None:
+                # No execution client currently serves this order's account (for
+                # example the account has been detached): there is no venue to ask,
+                # so never spend retries on it or fabricate a resolution once they
+                # "run out". Leave it exactly as-is until the account is reattached.
+                self._log.warning(
+                    f"Cannot check in-flight status for {order.client_order_id!r}: no "
+                    f"execution client for account {order.account_id}",
+                )
+                continue
+
             last_query_ts = self._ts_last_query.get(order.client_order_id)
             if last_query_ts and ts_now - last_query_ts < self._inflight_check_threshold_ns:
                 self._log.debug(
@@ -1410,6 +1421,17 @@ class LiveExecutionEngine(ExecutionEngine):
             order = self._cache.order(client_order_id)
             if order is None:
                 self._log.error(f"{client_order_id!r} missing at venue and not found in cache")
+                continue
+
+            if self._client_for_order(order) is None:
+                # No execution client currently serves this order's account (for
+                # example the account has been detached): there is no venue to ask,
+                # so never fabricate a resolution for it. Leave it as-is until the
+                # account is reattached.
+                self._log.warning(
+                    f"Cannot check open-order status for {client_order_id!r}: no "
+                    f"execution client for account {order.account_id}",
+                )
                 continue
 
             # Check if order is too recent to reconcile (avoid race conditions)

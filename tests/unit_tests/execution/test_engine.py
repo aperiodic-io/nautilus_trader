@@ -2556,8 +2556,13 @@ class TestExecutionEngine:
             clock=self.clock,
             oms_type=OmsType.NETTING,
         )
+        # `netting_client.account_id` is only set once the client connects, so build
+        # the account explicitly for BINANCE rather than passing the (still `None`)
+        # client attribute.
         self.portfolio.update_account(
-            TestEventStubs.margin_account_state(account_id=netting_client.account_id),
+            TestEventStubs.margin_account_state(
+                account_id=AccountId(f"{BTCUSDT_BINANCE.venue.value}-001"),
+            ),
         )
         self.exec_engine.register_client(netting_client)
         self.exec_engine.start()

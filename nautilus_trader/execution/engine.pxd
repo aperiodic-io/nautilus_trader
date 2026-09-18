@@ -52,6 +52,7 @@ cdef class ExecutionEngine(Component):
     cdef readonly dict[ClientId, ExecutionClient] _clients
     cdef readonly dict[Venue, ExecutionClient] _routing_map
     cdef readonly dict[Venue, list] _venue_clients
+    cdef readonly set[ClientId] _ever_registered_clients
     cdef readonly dict[StrategyId, OmsType] _oms_overrides
     cdef readonly dict[tuple, StrategyId] _external_order_claims_scoped
     cdef readonly dict[InstrumentId, tuple] _external_order_claims_any
@@ -117,6 +118,7 @@ cdef class ExecutionEngine(Component):
     cpdef void register_venue_routing(self, ExecutionClient client, Venue venue)
     cpdef void register_oms_type(self, Strategy strategy)
     cpdef void register_external_order_claims(self, Strategy strategy)
+    cpdef void deregister_external_order_claims(self, Strategy strategy)
     cpdef void deregister_client(self, ExecutionClient client)
 
 # -- ABSTRACT METHODS -----------------------------------------------------------------------------
@@ -133,6 +135,7 @@ cdef class ExecutionEngine(Component):
     cdef str _get_commands_topic(self, ClientId client_id)
     cpdef ExecutionClient _find_client_for_command(self, Command command)
     cpdef bint _is_multi_account_venue(self, Venue venue)
+    cdef void _sync_multi_account_venue_flag(self, Venue venue)
     cpdef ExecutionClient _venue_client(self, Venue venue)
     cpdef ExecutionClient _client_for_account(self, AccountId account_id)
     cpdef ExecutionClient _client_for_order(self, Order order)

@@ -578,6 +578,102 @@ class TestMultiAccountRegistration(_MultiAccountFixture):
         }
 
 
+class TestMultiAccountDetachedClientRouting(_MultiAccountFixture):
+    """
+    Once a client (account) is deregistered, any command that positively resolves to its
+    account must never be silently substituted with a different account's client - even
+    after the venue is back down to a single remaining client, where routing ordinarily
+    falls back to that sole client for genuinely unrelated commands.
+    """
+
+    def test_orphaned_cancel_is_not_misrouted_to_remaining_client(self) -> None:
+        # Arrange
+        order = self._limit()
+        self.strategy.submit_order(order, client_id=BINANCE1_CLIENT_ID)
+        self._accept(order, BINANCE1_ACCOUNT_ID)
+        self.exec_engine.deregister_client(self.clients[BINANCE1_CLIENT_ID])
+        assert not self.exec_engine._is_multi_account_venue(BINANCE)
+        assert self.exec_engine._routing_map[BINANCE] == self.clients[BINANCE2_CLIENT_ID]
+
+        # Act
+        self.exec_engine.execute(self._cancel_order_command(order))
+
+        # Assert - BINANCE2 never receives BINANCE1's orphaned cancel
+        assert self._calls(BINANCE2_CLIENT_ID) == []
+
+    def test_orphaned_query_order_is_not_misrouted_to_remaining_client(self) -> None:
+        # Arrange
+        order = self._limit()
+        self.strategy.submit_order(order, client_id=BINANCE1_CLIENT_ID)
+        self._accept(order, BINANCE1_ACCOUNT_ID)
+        self.exec_engine.deregister_client(self.clients[BINANCE1_CLIENT_ID])
+        query = QueryOrder(
+            trader_id=self.trader_id,
+            strategy_id=self.strategy.id,
+            instrument_id=order.instrument_id,
+            client_order_id=order.client_order_id,
+            venue_order_id=order.venue_order_id,
+            command_id=UUID4(),
+            ts_init=0,
+        )
+
+        # Act
+        self.exec_engine.execute(query)
+
+        # Assert
+        assert self._calls(BINANCE2_CLIENT_ID) == []
+
+    def test_orphaned_order_by_cached_client_id_alone_is_not_misrouted(self) -> None:
+        # Arrange - order pinned to BINANCE1 before it has an account_id
+        order = self._limit()
+        self.strategy.submit_order(order, client_id=BINANCE1_CLIENT_ID)
+        assert order.account_id is None
+        self.exec_engine.deregister_client(self.clients[BINANCE1_CLIENT_ID])
+
+        # Act
+        self.exec_engine.execute(self._cancel_order_command(order))
+
+        # Assert
+        assert self._calls(BINANCE2_CLIENT_ID) == []
+
+    def test_client_for_order_returns_none_for_orphaned_order(self) -> None:
+        # Arrange
+        order = self._limit()
+        self.strategy.submit_order(order, client_id=BINANCE1_CLIENT_ID)
+        self._accept(order, BINANCE1_ACCOUNT_ID)
+        self.exec_engine.deregister_client(self.clients[BINANCE1_CLIENT_ID])
+
+        # Act, Assert
+        assert self.exec_engine._client_for_order(order) is None
+
+    def test_new_unrelated_order_still_uses_the_single_remaining_client(self) -> None:
+        # Arrange - detach BINANCE1, leaving BINANCE2 as the venue's sole account
+        self.exec_engine.deregister_client(self.clients[BINANCE1_CLIENT_ID])
+        order = self._market()
+
+        # Act - a brand new order with no client_id and no prior history
+        self.strategy.submit_order(order)
+
+        # Assert - single-account convenience is preserved for genuinely new orders
+        assert self._calls(BINANCE2_CLIENT_ID) == ["submit_order"]
+
+    def test_reattaching_the_same_client_id_resolves_its_orphaned_orders_again(self) -> None:
+        # Arrange
+        order = self._limit()
+        self.strategy.submit_order(order, client_id=BINANCE1_CLIENT_ID)
+        self._accept(order, BINANCE1_ACCOUNT_ID)
+        self.exec_engine.deregister_client(self.clients[BINANCE1_CLIENT_ID])
+
+        # Act - the same account reconnects under the same client_id
+        reattached = self._make_client(BINANCE1_CLIENT_ID, BINANCE)
+        self.exec_engine.register_client(reattached)
+        self.exec_engine.execute(self._cancel_order_command(order))
+
+        # Assert
+        assert reattached.calls == ["cancel_order"]
+        assert self._calls(BINANCE2_CLIENT_ID) == []
+
+
 class TestMultiAccountOrderRouting(_MultiAccountFixture):
     @pytest.mark.parametrize(
         ("client_id", "instrument_id"),
@@ -1417,6 +1513,203 @@ class TestSingleAccountVenueUnchanged:
         assert self.exec_engine._venue_client(BINANCE) == self.client
         assert self.portfolio.account(BINANCE).id == self.account_id
 
+    def test_bare_claim_is_accepted_on_a_single_account_venue(self) -> None:
+        # Arrange, Act
+        strategy = Strategy(
+            StrategyConfig(
+                order_id_tag="002",
+                external_order_claims=[str(ETHUSDT_PERP_BINANCE.id)],
+            ),
+        )
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_external_order_claims(strategy)
+
+        # Assert
+        assert self.exec_engine.get_external_order_claim(ETHUSDT_PERP_BINANCE.id) == strategy.id
+
+    def test_bare_then_bare_claim_for_same_instrument_conflicts(self) -> None:
+        # Arrange
+        strategy1 = Strategy(
+            StrategyConfig(
+                order_id_tag="002",
+                external_order_claims=[str(ETHUSDT_PERP_BINANCE.id)],
+            ),
+        )
+        strategy1.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_external_order_claims(strategy1)
+
+        strategy2 = Strategy(
+            StrategyConfig(
+                order_id_tag="003",
+                external_order_claims=[str(ETHUSDT_PERP_BINANCE.id)],
+            ),
+        )
+        strategy2.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        # Act, Assert
+        with pytest.raises(InvalidConfiguration):
+            self.exec_engine.register_external_order_claims(strategy2)
+
+
+class TestSoleClientWithNonVenueNameUnaffected(_MultiAccountFixture):
+    """
+    Naming the only client for a venue something other than the venue itself (for
+    example "BINANCE1" instead of "BINANCE") must not change position IDs: suffixing
+    depends on whether the venue actually has more than one account, never on whether a
+    client's name happens to differ from the venue's name.
+    """
+
+    def setup(self) -> None:
+        # A single BINANCE1 client and nothing else for that venue
+        self.clock = TestClock()
+        self.trader_id = TestIdStubs.trader_id()
+        self.msgbus = MessageBus(trader_id=self.trader_id, clock=self.clock)
+        self.cache = Cache(database=MockCacheDatabase())
+        self.cache.add_instrument(ETHUSDT_PERP_BINANCE)
+        self.portfolio = Portfolio(msgbus=self.msgbus, cache=self.cache, clock=self.clock)
+        self.exec_engine = ExecutionEngine(msgbus=self.msgbus, cache=self.cache, clock=self.clock)
+        self.risk_engine = RiskEngine(
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.client = _RecordingExecutionClient(
+            client_id=BINANCE1_CLIENT_ID,
+            venue=BINANCE,
+            account_type=AccountType.MARGIN,
+            base_currency=None,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            oms_type=OmsType.NETTING,
+        )
+        self.exec_engine.register_client(self.client)
+        self.portfolio.update_account(_margin_account_state(BINANCE1_ACCOUNT_ID))
+        self.strategy = Strategy(StrategyConfig(oms_type="NETTING"))
+        self.strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_oms_type(self.strategy)
+        self.exec_engine.start()
+
+    def test_position_id_is_not_suffixed(self) -> None:
+        # Arrange
+        order = self.strategy.order_factory.market(
+            ETHUSDT_PERP_BINANCE.id,
+            OrderSide.BUY,
+            Quantity.from_str("1.000"),
+        )
+
+        # Act
+        self.strategy.submit_order(order, client_id=BINANCE1_CLIENT_ID)
+        self.exec_engine.process(
+            TestEventStubs.order_submitted(order, account_id=BINANCE1_ACCOUNT_ID),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_accepted(order, account_id=BINANCE1_ACCOUNT_ID),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                order,
+                ETHUSDT_PERP_BINANCE,
+                account_id=BINANCE1_ACCOUNT_ID,
+            ),
+        )
+
+        # Assert - hand-built hedge-mode strings like "{instrument}-{strategy}" still work
+        position = self.cache.positions_open()[0]
+        assert position.id == PositionId(f"{ETHUSDT_PERP_BINANCE.id}-{self.strategy.id}")
+
+    def test_becomes_suffixed_once_a_second_account_joins(self) -> None:
+        # Arrange - open a position while solo
+        order1 = self.strategy.order_factory.market(
+            ETHUSDT_PERP_BINANCE.id,
+            OrderSide.BUY,
+            Quantity.from_str("1.000"),
+        )
+        self.strategy.submit_order(order1, client_id=BINANCE1_CLIENT_ID)
+        self.exec_engine.process(
+            TestEventStubs.order_submitted(order1, account_id=BINANCE1_ACCOUNT_ID),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_accepted(order1, account_id=BINANCE1_ACCOUNT_ID),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                order1,
+                ETHUSDT_PERP_BINANCE,
+                account_id=BINANCE1_ACCOUNT_ID,
+            ),
+        )
+        plain_id = PositionId(f"{ETHUSDT_PERP_BINANCE.id}-{self.strategy.id}")
+        assert self.cache.position(plain_id) is not None
+
+        # Act - a second account joins the venue
+        second = _RecordingExecutionClient(
+            client_id=BINANCE2_CLIENT_ID,
+            venue=BINANCE,
+            account_type=AccountType.MARGIN,
+            base_currency=None,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            oms_type=OmsType.NETTING,
+        )
+        self.exec_engine.register_client(second)
+        assert self.exec_engine._is_multi_account_venue(BINANCE)
+
+        order2 = self.strategy.order_factory.market(
+            ETHUSDT_PERP_BINANCE.id,
+            OrderSide.BUY,
+            Quantity.from_str("1.000"),
+        )
+        self.strategy.submit_order(order2, client_id=BINANCE1_CLIENT_ID)
+        self.exec_engine.process(
+            TestEventStubs.order_submitted(order2, account_id=BINANCE1_ACCOUNT_ID),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_accepted(order2, account_id=BINANCE1_ACCOUNT_ID),
+        )
+        self.exec_engine.process(
+            TestEventStubs.order_filled(
+                order2,
+                ETHUSDT_PERP_BINANCE,
+                account_id=BINANCE1_ACCOUNT_ID,
+            ),
+        )
+
+        # Assert - the same account now nets under the suffixed ID, since the venue is
+        # no longer solo; the prior plain-ID position is unaffected (a new fill would
+        # need to target it explicitly by position_id, which is a NETTING/OMS concern,
+        # not a routing one)
+        suffixed_id = PositionId(
+            f"{ETHUSDT_PERP_BINANCE.id}-{self.strategy.id}-{BINANCE1_CLIENT_ID}",
+        )
+        assert self.cache.position(suffixed_id) is not None
+
 
 class TestMultiAccountHedgingPositions(_MultiAccountFixture):
     oms_type = "HEDGING"
@@ -1651,6 +1944,38 @@ class TestMultiAccountRisk(_MultiAccountFixture):
         # Assert - denied for the ambiguous account, not for a balance
         assert order.status == OrderStatus.DENIED
         assert "AMBIGUOUS_ACCOUNT" in order.last_event.reason
+
+    def test_order_to_freshly_attached_account_with_no_state_yet_is_denied(self) -> None:
+        # Arrange - a third account attaches (for example a session retry, or a PM
+        # handback) but has not yet received its first account state; this is the
+        # exact race described by F9
+        fresh_client_id = ClientId("BINANCE3")
+        fresh_client = self._make_client(fresh_client_id, BINANCE)
+        self.exec_engine.register_client(fresh_client)
+        order = self._btc_market()
+
+        # Act
+        self.strategy.submit_order(order, client_id=fresh_client_id)
+
+        # Assert - denied rather than silently passed through with no risk check
+        assert order.status == OrderStatus.DENIED
+        assert "ACCOUNT_NOT_FOUND" in order.last_event.reason
+        assert [c for c in fresh_client.calls if c != "_start"] == []
+
+    def test_order_list_to_freshly_attached_account_with_no_state_yet_is_denied(self) -> None:
+        # Arrange
+        fresh_client_id = ClientId("BINANCE3")
+        fresh_client = self._make_client(fresh_client_id, BINANCE)
+        self.exec_engine.register_client(fresh_client)
+        bracket = self._bracket()
+
+        # Act
+        self.strategy.submit_order_list(bracket, client_id=fresh_client_id)
+
+        # Assert
+        assert all(o.status == OrderStatus.DENIED for o in bracket.orders)
+        assert all("ACCOUNT_NOT_FOUND" in o.last_event.reason for o in bracket.orders)
+        assert [c for c in fresh_client.calls if c != "_start"] == []
 
     def test_order_list_to_underfunded_account_is_denied(self) -> None:
         # Arrange
@@ -2176,29 +2501,54 @@ class TestMultiAccountExternalOrderClaims(_MultiAccountFixture):
         self.exec_engine.register_external_order_claims(strategy)
         return strategy
 
-    def test_bare_claim_on_multi_account_venue_is_not_applied(self) -> None:
-        # Arrange
-        strategy = self._register_claim_strategy(str(ETHUSDT_PERP_BINANCE.id))
+    def test_bare_claim_on_multi_account_venue_is_rejected_at_registration(self) -> None:
+        # Act, Assert - a venue with multiple accounts has no default account, so an
+        # unscoped claim can never apply; this is now rejected up front (F4) rather than
+        # silently accepted and ignored
+        with pytest.raises(InvalidConfiguration):
+            self._register_claim_strategy(str(ETHUSDT_PERP_BINANCE.id))
 
-        # Act
-        result = self.exec_engine.get_external_order_claim(ETHUSDT_PERP_BINANCE.id)
+        assert self.exec_engine.get_external_order_claims_instruments() == set()
 
-        # Assert - unscoped claim does not apply on a venue with multiple accounts
-        assert result is None
-        assert strategy.external_order_claims[0].client_id is None
-        assert ETHUSDT_PERP_BINANCE.id in self.exec_engine._external_order_claims_warned
+    def test_bare_claim_rejected_before_a_second_account_joins_the_venue(self) -> None:
+        # Arrange - a fresh single-account venue (OKX has no clients registered yet
+        # for this fixture's `_register_claim_strategy`, but exercising the exact
+        # scenario needs the venue to gain a second client after the claim exists)
+        msgbus = MessageBus(trader_id=self.trader_id, clock=self.clock)
+        cache = Cache(database=MockCacheDatabase())
+        cache.add_instrument(ETHUSDT_SWAP_OKX)
+        portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=self.clock)
+        exec_engine = ExecutionEngine(
+            msgbus=msgbus,
+            cache=cache,
+            clock=self.clock,
+            config=ExecEngineConfig(debug=True),
+        )
+        first_client = self._make_client(OKX1_CLIENT_ID, OKX)
+        exec_engine.register_client(first_client)
 
-    def test_bare_claim_warning_is_logged_once(self) -> None:
-        # Arrange
-        self._register_claim_strategy(str(ETHUSDT_PERP_BINANCE.id))
+        strategy = Strategy(
+            StrategyConfig(order_id_tag="001", external_order_claims=[str(ETHUSDT_SWAP_OKX.id)]),
+        )
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=portfolio,
+            msgbus=msgbus,
+            cache=cache,
+            clock=self.clock,
+        )
+        exec_engine.register_external_order_claims(strategy)
+        assert exec_engine.get_external_order_claim(ETHUSDT_SWAP_OKX.id) == strategy.id
 
-        # Act
-        self.exec_engine.get_external_order_claim(ETHUSDT_PERP_BINANCE.id)
-        self.exec_engine.get_external_order_claim(ETHUSDT_PERP_BINANCE.id)
-        self.exec_engine.get_external_order_claim(ETHUSDT_PERP_BINANCE.id)
+        # Act, Assert - attaching a second account for the venue must not be allowed to
+        # silently strand the bare claim; registration of the second client is refused
+        second_client = self._make_client(OKX2_CLIENT_ID, OKX)
+        with pytest.raises(ValueError, match="unscoped external order claims"):
+            exec_engine.register_client(second_client)
 
-        # Assert
-        assert self.exec_engine._external_order_claims_warned == {ETHUSDT_PERP_BINANCE.id}
+        # The claim still resolves: the second client's registration was rejected, so
+        # the venue remains single-account
+        assert exec_engine.get_external_order_claim(ETHUSDT_SWAP_OKX.id) == strategy.id
 
     def test_scoped_claim_applies_only_to_that_account(self) -> None:
         # Arrange
@@ -2309,14 +2659,6 @@ class TestMultiAccountExternalOrderClaims(_MultiAccountFixture):
         with pytest.raises(InvalidConfiguration):
             self._register_claim_strategy(f"{ETHUSDT_PERP_BINANCE.id}@*", order_id_tag="002")
 
-    def test_bare_then_bare_claim_for_same_instrument_conflicts(self) -> None:
-        # Arrange
-        self._register_claim_strategy(str(ETHUSDT_PERP_BINANCE.id), order_id_tag="001")
-
-        # Act, Assert
-        with pytest.raises(InvalidConfiguration):
-            self._register_claim_strategy(str(ETHUSDT_PERP_BINANCE.id), order_id_tag="002")
-
     def test_claims_instruments_returns_union_of_all_forms(self) -> None:
         # Arrange
         self._register_claim_strategy(
@@ -2330,3 +2672,166 @@ class TestMultiAccountExternalOrderClaims(_MultiAccountFixture):
 
         # Assert
         assert result == {ETHUSDT_PERP_BINANCE.id, ETHUSDT_SWAP_OKX.id}
+
+    def test_deregister_removes_scoped_claim_and_frees_it_for_reregistration(self) -> None:
+        # Arrange
+        strategy = self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE1_CLIENT_ID}",
+        )
+
+        # Act
+        self.exec_engine.deregister_external_order_claims(strategy)
+
+        # Assert - claim is gone
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE1_ACCOUNT_ID,
+            )
+            is None
+        )
+
+        # Re-registering the identical claim (for example the same stable strategy ID
+        # rejoining after a session retry) no longer raises
+        strategy2 = self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE1_CLIENT_ID}",
+            order_id_tag="002",
+        )
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE1_ACCOUNT_ID,
+            )
+            == strategy2.id
+        )
+
+    def test_deregister_removes_wildcard_claim_and_frees_it_for_reregistration(self) -> None:
+        # Arrange
+        strategy = self._register_claim_strategy(f"{ETHUSDT_PERP_BINANCE.id}@*")
+
+        # Act
+        self.exec_engine.deregister_external_order_claims(strategy)
+
+        # Assert
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE1_ACCOUNT_ID,
+            )
+            is None
+        )
+        assert ETHUSDT_PERP_BINANCE.id not in self.exec_engine._external_order_claims_any
+
+        strategy2 = self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@*",
+            order_id_tag="002",
+        )
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE1_ACCOUNT_ID,
+            )
+            == strategy2.id
+        )
+
+    def test_deregister_removes_bare_claim_and_frees_it_for_reregistration(self) -> None:
+        # Arrange - a bare claim only registers on a single-account venue (F4), so this
+        # uses a fresh engine with just one client rather than the fixture's two-client
+        # BINANCE/OKX setup
+        msgbus = MessageBus(trader_id=self.trader_id, clock=self.clock)
+        cache = Cache(database=MockCacheDatabase())
+        cache.add_instrument(ETHUSDT_SWAP_OKX)
+        portfolio = Portfolio(msgbus=msgbus, cache=cache, clock=self.clock)
+        exec_engine = ExecutionEngine(
+            msgbus=msgbus,
+            cache=cache,
+            clock=self.clock,
+            config=ExecEngineConfig(debug=True),
+        )
+        exec_engine.register_client(self._make_client(OKX1_CLIENT_ID, OKX))
+
+        def _register(order_id_tag: str) -> Strategy:
+            strategy = Strategy(
+                StrategyConfig(
+                    order_id_tag=order_id_tag,
+                    external_order_claims=[str(ETHUSDT_SWAP_OKX.id)],
+                ),
+            )
+            strategy.register(
+                trader_id=self.trader_id,
+                portfolio=portfolio,
+                msgbus=msgbus,
+                cache=cache,
+                clock=self.clock,
+            )
+            exec_engine.register_external_order_claims(strategy)
+            return strategy
+
+        strategy = _register("001")
+
+        # Act
+        exec_engine.deregister_external_order_claims(strategy)
+
+        # Assert
+        assert ETHUSDT_SWAP_OKX.id not in exec_engine._external_order_claims_any
+
+        # Re-registering does not raise
+        _register("002")
+
+    def test_deregister_only_removes_the_given_strategys_claims(self) -> None:
+        # Arrange
+        strategy1 = self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE1_CLIENT_ID}",
+            order_id_tag="001",
+        )
+        strategy2 = self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE2_CLIENT_ID}",
+            order_id_tag="002",
+        )
+
+        # Act
+        self.exec_engine.deregister_external_order_claims(strategy1)
+
+        # Assert - strategy1's claim is gone, strategy2's claim is untouched
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE1_ACCOUNT_ID,
+            )
+            is None
+        )
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE2_ACCOUNT_ID,
+            )
+            == strategy2.id
+        )
+
+    def test_deregister_strategy_with_no_claims_is_a_no_op(self) -> None:
+        # Arrange
+        strategy = Strategy(StrategyConfig(order_id_tag="001"))
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_external_order_claims(strategy)
+
+        # Act, Assert - does not raise
+        self.exec_engine.deregister_external_order_claims(strategy)
+
+    def test_deregister_then_reregister_does_not_affect_other_instruments_claims(self) -> None:
+        # Arrange
+        strategy = self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE1_CLIENT_ID}",
+            f"{ETHUSDT_SWAP_OKX.id}@*",
+        )
+
+        # Act
+        self.exec_engine.deregister_external_order_claims(strategy)
+
+        # Assert - both claims removed since they belonged to the same strategy
+        assert self.exec_engine.get_external_order_claims_instruments() == set()

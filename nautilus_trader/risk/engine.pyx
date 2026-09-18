@@ -60,6 +60,7 @@ from nautilus_trader.model.functions cimport order_type_to_str
 from nautilus_trader.model.functions cimport trading_state_to_str
 from nautilus_trader.model.functions cimport trailing_offset_type_to_str
 from nautilus_trader.model.identifiers cimport AccountId
+from nautilus_trader.model.identifiers cimport ClientId
 from nautilus_trader.model.identifiers cimport ComponentId
 from nautilus_trader.model.identifiers cimport InstrumentId
 from nautilus_trader.model.identifiers cimport PositionId
@@ -451,7 +452,12 @@ cdef class RiskEngine(Component):
         if not self._check_order(instrument, order):
             return  # Denied
 
-        if not self._check_orders_risk(instrument, [order], self._resolve_account_id(command)):
+        if not self._check_orders_risk(
+            instrument,
+            [order],
+            self._resolve_account_id(command),
+            command.client_id,
+        ):
             return # Denied
 
         self._execution_gateway(instrument, command)
@@ -493,6 +499,7 @@ cdef class RiskEngine(Component):
             representative,
             order_list.orders,
             self._resolve_account_id(command),
+            command.client_id,
         ):
             self._deny_order_list(order_list, f"OrderList {order_list.id.to_str()} DENIED")
             return  # Denied
@@ -670,7 +677,13 @@ cdef class RiskEngine(Component):
 
         return None
 
-    cpdef bint _check_orders_risk(self, Instrument instrument, list orders, AccountId default_account_id = None):
+    cpdef bint _check_orders_risk(
+        self,
+        Instrument instrument,
+        list orders,
+        AccountId default_account_id = None,
+        ClientId requested_client_id = None,
+    ):
         ########################################################################
         # RISK CHECKS
         ########################################################################
@@ -691,17 +704,29 @@ cdef class RiskEngine(Component):
         # Check each account group separately
         cdef list account_orders
         for account_id, account_orders in orders_by_account.items():
-            if not self._check_orders_risk_for_account(instrument, account_orders, account_id):
+            if not self._check_orders_risk_for_account(
+                instrument,
+                account_orders,
+                account_id,
+                requested_client_id,
+            ):
                 return False  # Denied
 
         return True  # All checks passed
 
-    cpdef bint _check_orders_risk_for_account(self, Instrument instrument, list orders, AccountId account_id):
+    cpdef bint _check_orders_risk_for_account(
+        self,
+        Instrument instrument,
+        list orders,
+        AccountId account_id,
+        ClientId requested_client_id = None,
+    ):
         # Check orders for a specific account (or venue-based lookup if account_id is None)
         cdef QuoteTick last_quote = None
         cdef TradeTick last_trade = None
         cdef Price last_px = None
         cdef Money free
+        cdef Order unresolved_order
 
         # Determine max notional
         cdef Money max_notional = None
@@ -715,11 +740,34 @@ cdef class RiskEngine(Component):
         cdef Account account = self._cache.account_for_venue(instrument.id.venue, account_id)
 
         if account is None:
+            if account_id is not None or requested_client_id is not None:
+                # A specific account or client was identified for these orders
+                # (through the command's client_id, a referenced position, an order
+                # already carrying an account_id, or an explicit routing client_id
+                # whose account has not resolved), but no account state has been
+                # received for it yet (for example, immediately after an execution
+                # client attaches but before its first account state has been
+                # processed). There is no default account to fall back on, so the
+                # free balance and net-position checks below cannot run; deny rather
+                # than silently letting the orders pass with no risk check at all.
+                target = account_id if account_id is not None else requested_client_id
+                for unresolved_order in orders:
+                    self._deny_order(
+                        order=unresolved_order,
+                        reason=f"ACCOUNT_NOT_FOUND: no account found for {target!r}",
+                    )
+
+                return False  # Denied
+
+            # No specific account or client could be identified at all (for example,
+            # the venue has no execution client registered, or none has connected
+            # yet); there is nothing to check risk against, so fall through and let
+            # downstream routing (which may itself deny, for example an ambiguous
+            # multi-account venue) handle these orders.
             self._log.debug(
-                f"Cannot find account for venue {instrument.id.venue} "
-                f"(account_id={account_id.get_issuer() if account_id is not None else None})"
+                f"Cannot find account for venue {instrument.id.venue}",
             )
-            return True  # TODO: Temporary early return until handling routing/multiple venues
+            return True
 
         if account.is_margin_account:
             return True  # TODO: Determine risk controls for margin

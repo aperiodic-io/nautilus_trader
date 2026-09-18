@@ -300,6 +300,56 @@ class TestTrader:
         assert not strategy.is_running
         assert self.trader.strategies() == []
 
+    def test_remove_strategy_deregisters_its_external_order_claims(self) -> None:
+        # Arrange
+        config = StrategyConfig(
+            order_id_tag="001",
+            external_order_claims=[str(USDJPY_SIM.id)],
+        )
+        strategy = Strategy(config=config)
+        self.trader.add_strategy(strategy)
+        assert self.exec_engine.get_external_order_claim(USDJPY_SIM.id) == strategy.id
+
+        # Act
+        self.trader.remove_strategy(strategy.id)
+
+        # Assert - claim is gone, and a strategy with the same claim can be re-added
+        assert self.exec_engine.get_external_order_claim(USDJPY_SIM.id) is None
+
+        strategy2 = Strategy(
+            config=StrategyConfig(
+                order_id_tag="002",
+                external_order_claims=[str(USDJPY_SIM.id)],
+            ),
+        )
+        self.trader.add_strategy(strategy2)
+        assert self.exec_engine.get_external_order_claim(USDJPY_SIM.id) == strategy2.id
+
+    def test_clear_strategies_deregisters_external_order_claims(self) -> None:
+        # Arrange
+        config = StrategyConfig(
+            order_id_tag="001",
+            external_order_claims=[str(USDJPY_SIM.id)],
+        )
+        strategy = Strategy(config=config)
+        self.trader.add_strategy(strategy)
+        assert self.exec_engine.get_external_order_claim(USDJPY_SIM.id) == strategy.id
+
+        # Act
+        self.trader.clear_strategies()
+
+        # Assert
+        assert self.exec_engine.get_external_order_claim(USDJPY_SIM.id) is None
+
+        strategy2 = Strategy(
+            config=StrategyConfig(
+                order_id_tag="002",
+                external_order_claims=[str(USDJPY_SIM.id)],
+            ),
+        )
+        self.trader.add_strategy(strategy2)
+        assert self.exec_engine.get_external_order_claim(USDJPY_SIM.id) == strategy2.id
+
     def test_add_strategies_with_no_order_id_tags(self) -> None:
         # Arrange
         strategies = [Strategy(), Strategy()]

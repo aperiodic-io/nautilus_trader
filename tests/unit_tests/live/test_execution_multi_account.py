@@ -22,6 +22,7 @@ import pytest
 
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
+from nautilus_trader.common.config import InvalidConfiguration
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import StrategyConfig
@@ -886,16 +887,12 @@ class TestLiveReconciliationExternalOrderClaims:
         assert first_order.strategy_id == strategy.id
         assert second_order.strategy_id == strategy.id
 
-    def test_reconciled_order_with_bare_claim_on_multi_account_venue_is_external(self) -> None:
-        # Arrange - SIM has two accounts, so the bare claim does not apply
-        self._register_claim_strategy(str(AUDUSD_SIM.id))
-        report = self._order_status_report(FIRST_ACCOUNT_ID)
-
-        # Act
-        order = self.exec_engine._generate_order(report)
-
-        # Assert
-        assert order.strategy_id == StrategyId("EXTERNAL")
+    def test_bare_claim_on_multi_account_venue_is_rejected_at_registration(self) -> None:
+        # Arrange, Act, Assert - SIM already has two accounts, so an unscoped claim can
+        # never apply and is rejected up front (F4) rather than silently ignored, which
+        # would otherwise leave prior-attempt orders unclaimed with nothing to cancel them
+        with pytest.raises(InvalidConfiguration):
+            self._register_claim_strategy(str(AUDUSD_SIM.id))
 
 
 class TestStartupReconciliationPartialFailure:
@@ -1062,3 +1059,140 @@ class TestStartupReconciliationPartialFailure:
         # Assert
         assert result is True
         assert engine.reconciliation_startup_failed_clients == {SECOND_CLIENT_ID}
+
+
+class TestOrphanedOrderNeverGetsFabricatedTerminalState:
+    """
+    Once an account's client is detached, the periodic in-flight and open-order checks
+    have no way to ask its venue anything. They must recognize this and leave the.
+
+    account's orders untouched rather than eventually marking them REJECTED/CANCELED
+    purely because retries ran out - retries ran out because nothing was ever actually
+    asked, not because the venue failed to answer.
+
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, request):
+        self.loop = request.getfixturevalue("event_loop")
+        self.clock = LiveClock()
+        self.trader_id = TestIdStubs.trader_id()
+        self.msgbus = MessageBus(trader_id=self.trader_id, clock=self.clock)
+        self.cache = TestComponentStubs.cache()
+        self.cache.add_instrument(AUDUSD_SIM)
+        self.exec_engine = LiveExecutionEngine(
+            loop=self.loop,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            config=LiveExecEngineConfig(
+                inflight_check_threshold_ms=0,
+                inflight_check_retries=1,
+                open_check_open_only=False,
+                open_check_threshold_ms=0,
+                open_check_missing_retries=1,
+            ),
+        )
+        self.first = self._make_client(FIRST_CLIENT_ID)
+        self.second = self._make_client(SECOND_CLIENT_ID)
+        self.exec_engine.register_client(self.first)
+        self.exec_engine.register_client(self.second)
+
+    def _make_client(self, client_id: ClientId) -> MockLiveExecutionClient:
+        return MockLiveExecutionClient(
+            loop=self.loop,
+            client_id=client_id,
+            venue=SIM,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            instrument_provider=InstrumentProvider(),
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+    def _submitted_order(self, account_id: AccountId):
+        order = TestExecStubs.limit_order(instrument=AUDUSD_SIM)
+        self.cache.add_order(order)
+        submitted = TestEventStubs.order_submitted(
+            order,
+            account_id=account_id,
+            ts_event=self.clock.timestamp_ns() - 1,
+        )
+        order.apply(submitted)
+        self.exec_engine.process(submitted)
+        self.cache.update_order(order)
+        return order
+
+    @pytest.mark.asyncio
+    async def test_inflight_check_does_not_query_the_other_account_for_a_detached_order(
+        self,
+    ) -> None:
+        # Arrange
+        order = self._submitted_order(FIRST_ACCOUNT_ID)
+        self.exec_engine.deregister_client(self.first)
+
+        # Act
+        await self.exec_engine._check_inflight_orders()
+
+        # Assert - BINANCE2's client never receives a query for BINANCE1's order
+        assert self.second.calls == []
+        assert order.status == OrderStatus.SUBMITTED
+
+    @pytest.mark.asyncio
+    async def test_inflight_check_never_fabricates_a_terminal_state_for_a_detached_order(
+        self,
+    ) -> None:
+        # Arrange
+        order = self._submitted_order(FIRST_ACCOUNT_ID)
+        self.exec_engine.deregister_client(self.first)
+
+        # Act - run the check repeatedly, well past inflight_check_retries=1
+        for _ in range(5):
+            await self.exec_engine._check_inflight_orders()
+
+        # Assert - never resolved as REJECTED purely because retries "ran out"
+        assert order.status == OrderStatus.SUBMITTED
+        assert self.second.calls == []
+
+    @pytest.mark.asyncio
+    async def test_inflight_check_resumes_once_the_account_is_reattached(self) -> None:
+        # Arrange
+        order = self._submitted_order(FIRST_ACCOUNT_ID)
+        self.exec_engine.deregister_client(self.first)
+        await self.exec_engine._check_inflight_orders()
+        assert order.status == OrderStatus.SUBMITTED
+
+        # Act - the account reconnects under the same client_id
+        reattached = self._make_client(FIRST_CLIENT_ID)
+        self.exec_engine.register_client(reattached)
+        await self.exec_engine._check_inflight_orders()
+
+        # Assert - normal querying resumes for the reattached account
+        assert "query_order" not in self.second.calls
+        # A QueryOrder command was routed and executed for the reattached client
+        assert self.exec_engine.command_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_open_order_check_does_not_treat_a_detached_accounts_order_as_missing(
+        self,
+    ) -> None:
+        # Arrange - an accepted (open) order on the account about to be detached
+        order = self._submitted_order(FIRST_ACCOUNT_ID)
+        order.apply(
+            TestEventStubs.order_accepted(
+                order,
+                account_id=FIRST_ACCOUNT_ID,
+                venue_order_id=VenueOrderId("V-1"),
+            ),
+        )
+        self.cache.update_order(order)
+        self.exec_engine.deregister_client(self.first)
+
+        # Act
+        await self.exec_engine._check_orders_consistency()
+
+        # Assert - never resolved via the second account's client, and no fabricated
+        # terminal state
+        assert "generate_order_status_report" not in self.second.calls
+        assert order.status == OrderStatus.ACCEPTED
