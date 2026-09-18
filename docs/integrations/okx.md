@@ -1356,6 +1356,59 @@ node.add_exec_client_factory(OKX, OKXLiveExecClientFactory)
 node.build()
 ```
 
+## Multiple accounts
+
+The legacy v1 adapter can trade several OKX accounts (separate API keys) from one
+`TradingNode`. Each account runs its own execution client; one data client serves market data
+for all of them. There is no default account: every order must resolve to an account.
+
+1. Give each account a distinct key without a hyphen, such as `OKX1` and `OKX2`. No key may be
+   the venue name `OKX` when the venue has multiple accounts. The node builder only uses the part
+   of a key before the first `-`, and the key becomes the client ID and the account ID issuer (for
+   example `OKX2-master`).
+2. Register the execution client factory under each key.
+3. Set `api_key`, `api_secret`, and `api_passphrase` explicitly for each account. The environment
+   variable fallback resolves a single set of credentials.
+
+```python
+config = TradingNodeConfig(
+    ...,
+    data_clients={
+        OKX: OKXDataClientConfig(instrument_types=(OKXInstrumentType.SWAP,)),
+    },
+    exec_clients={
+        "OKX1": OKXExecClientConfig(
+            api_key=account1_api_key,
+            api_secret=account1_api_secret,
+            api_passphrase=account1_api_passphrase,
+            instrument_types=(OKXInstrumentType.SWAP,),
+        ),
+        "OKX2": OKXExecClientConfig(
+            api_key=account2_api_key,
+            api_secret=account2_api_secret,
+            api_passphrase=account2_api_passphrase,
+            instrument_types=(OKXInstrumentType.SWAP,),
+        ),
+    },
+)
+node = TradingNode(config=config)
+node.add_data_client_factory(OKX, OKXLiveDataClientFactory)
+node.add_exec_client_factory("OKX1", OKXLiveExecClientFactory)
+node.add_exec_client_factory("OKX2", OKXLiveExecClientFactory)
+node.build()
+```
+
+In the strategy, pass the client ID of the account when submitting orders. An order without a
+`client_id` (that does not target an existing position) is denied:
+
+```python
+self.submit_order(order, client_id=ClientId("OKX2"))
+```
+
+Modify, cancel, and close commands route to the account of the order or position they refer
+to. For more on routing, positions, and account queries with several accounts per venue, see
+[Multiple accounts per venue](../concepts/execution.md#multiple-accounts-per-venue).
+
 ## Contributing
 
 :::info

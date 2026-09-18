@@ -16,8 +16,14 @@
 import pytest
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
+from nautilus_trader.adapters.binance.common.enums import BinanceFuturesPositionSide
+from nautilus_trader.adapters.binance.common.positions import make_venue_position_id
 from nautilus_trader.adapters.binance.common.symbol import BinanceSymbol
 from nautilus_trader.adapters.binance.common.symbol import BinanceSymbols
+from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesEnumParser
+from nautilus_trader.model.identifiers import AccountId
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import PositionId
 
 
 class TestBinanceCoreFunctions:
@@ -137,3 +143,81 @@ class TestBinanceCoreFunctions:
     def test_binance_account_type_is_futures(self, account_type, expected):
         # Arrange, Act, Assert
         assert account_type.is_futures == expected
+
+    @pytest.mark.parametrize(
+        ("account_id", "is_multi_account", "expected"),
+        [
+            # A venue with a single account keeps the plain ID, whatever the client
+            # (and hence the account issuer) is named
+            ("BINANCE-USDT_FUTURES-master", False, "ETHUSDT-PERP.BINANCE-LONG"),
+            ("BINANCE1-USDT_FUTURES-master", False, "ETHUSDT-PERP.BINANCE-LONG"),
+            # Every account of a venue with multiple accounts is suffixed with its
+            # issuer, regardless of which one happens to be named after the venue
+            ("BINANCE1-USDT_FUTURES-master", True, "ETHUSDT-PERP.BINANCE-LONG-BINANCE1"),
+            ("BINANCE2-USDT_FUTURES-master", True, "ETHUSDT-PERP.BINANCE-LONG-BINANCE2"),
+        ],
+    )
+    def test_make_venue_position_id(self, account_id, is_multi_account, expected):
+        # Arrange
+        instrument_id = InstrumentId.from_str("ETHUSDT-PERP.BINANCE")
+
+        # Act
+        result = make_venue_position_id(
+            instrument_id,
+            "LONG",
+            AccountId(account_id),
+            is_multi_account,
+        )
+
+        # Assert
+        assert result == PositionId(expected)
+
+    @pytest.mark.parametrize(
+        ("position_id", "expected"),
+        [
+            ("001-LONG", BinanceFuturesPositionSide.LONG),
+            ("001-SHORT", BinanceFuturesPositionSide.SHORT),
+            ("001-BOTH", BinanceFuturesPositionSide.BOTH),
+            ("ETHUSDT-PERP.BINANCE-LONG", BinanceFuturesPositionSide.LONG),
+            ("ETHUSDT-PERP.BINANCE-LONG-BINANCE1", BinanceFuturesPositionSide.LONG),
+            ("ETHUSDT-PERP.BINANCE-SHORT-BINANCE2", BinanceFuturesPositionSide.SHORT),
+            ("ETHUSDT-PERP.BINANCE-BOTH-BINANCE10", BinanceFuturesPositionSide.BOTH),
+        ],
+    )
+    def test_parse_position_id_to_position_side(self, position_id, expected):
+        # Act
+        result = BinanceFuturesEnumParser().parse_position_id_to_binance_futures_position_side(
+            PositionId(position_id),
+        )
+
+        # Assert
+        assert result == expected
+
+    @pytest.mark.parametrize(
+        "position_id",
+        ["ETHUSDT-PERP.BINANCE-S-001", "ETHUSDT-PERP.BINANCE-S-001-BINANCE2", "P-123"],
+    )
+    def test_parse_position_id_without_position_side_raises(self, position_id):
+        # Act, Assert
+        with pytest.raises(RuntimeError, match="unrecognized position id"):
+            BinanceFuturesEnumParser().parse_position_id_to_binance_futures_position_side(
+                PositionId(position_id),
+            )
+
+    @pytest.mark.parametrize("position_side", ["LONG", "SHORT"])
+    def test_make_venue_position_id_round_trips_through_parser(self, position_side):
+        # Arrange
+        position_id = make_venue_position_id(
+            InstrumentId.from_str("ETHUSDT-PERP.BINANCE"),
+            position_side,
+            AccountId("BINANCE2-USDT_FUTURES-master"),
+            True,
+        )
+
+        # Act
+        side = BinanceFuturesEnumParser().parse_position_id_to_binance_futures_position_side(
+            position_id,
+        )
+
+        # Assert
+        assert side == BinanceFuturesPositionSide(position_side)

@@ -42,6 +42,7 @@ from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.events import OrderDenied
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderUpdated
+from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Symbol
@@ -926,6 +927,61 @@ async def test_cancel_all_orders_uses_batch_cancel_by_default(
     private_ws.batch_cancel_orders.assert_called_once()
     call_args = private_ws.batch_cancel_orders.call_args[0][0]
     assert len(call_args) == 5
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_orders_ignores_orders_of_other_account(
+    exec_client_builder,
+    monkeypatch,
+    instrument,
+):
+    # Arrange
+    client, private_ws, _, _, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={"use_mm_mass_cancel": False},
+    )
+    client._cache.add_instrument(instrument)
+
+    for i, account_id in enumerate((client.account_id, AccountId("OKXB-master"))):
+        order = LimitOrder(
+            trader_id=TestIdStubs.trader_id(),
+            strategy_id=TestIdStubs.strategy_id(),
+            instrument_id=instrument.id,
+            client_order_id=ClientOrderId(f"O-account-{i}"),
+            order_side=OrderSide.BUY,
+            quantity=Quantity.from_int(100),
+            price=Price.from_str("1.0000"),
+            init_id=TestIdStubs.uuid(),
+            ts_init=0,
+        )
+        client._cache.add_order(order, None, None)
+        order.apply(TestEventStubs.order_submitted(order=order, account_id=account_id))
+        client._cache.update_order(order)
+        order.apply(
+            TestEventStubs.order_accepted(
+                order=order,
+                account_id=account_id,
+                venue_order_id=VenueOrderId(f"venue-account-{i}"),
+            ),
+        )
+        client._cache.update_order(order)
+
+    command = CancelAllOrders(
+        trader_id=TestIdStubs.trader_id(),
+        strategy_id=TestIdStubs.strategy_id(),
+        instrument_id=instrument.id,
+        order_side=OrderSide.NO_ORDER_SIDE,
+        command_id=TestIdStubs.uuid(),
+        ts_init=0,
+    )
+
+    # Act
+    await client._cancel_all_orders(command)
+
+    # Assert - only the order of this client's account is canceled
+    private_ws.batch_cancel_orders.assert_called_once()
+    call_args = private_ws.batch_cancel_orders.call_args[0][0]
+    assert len(call_args) == 1
 
 
 @pytest.mark.asyncio

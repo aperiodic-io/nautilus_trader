@@ -27,8 +27,10 @@ attempts to operate without a managing `Trader` instance.
 
 import pandas as pd
 
+from nautilus_trader.trading.config import ExternalOrderClaim
 from nautilus_trader.trading.config import ImportableStrategyConfig
 from nautilus_trader.trading.config import StrategyConfig
+from nautilus_trader.trading.config import parse_external_order_claims
 
 from libc.stdint cimport uint64_t
 
@@ -95,6 +97,7 @@ from nautilus_trader.model.identifiers cimport InstrumentId
 from nautilus_trader.model.identifiers cimport PositionId
 from nautilus_trader.model.identifiers cimport StrategyId
 from nautilus_trader.model.identifiers cimport TraderId
+from nautilus_trader.model.identifiers cimport Venue
 from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
 from nautilus_trader.model.orders.base cimport LIMIT_ORDER_TYPES
@@ -191,18 +194,8 @@ cdef class Strategy(Actor):
     def _parse_external_order_claims(
         self,
         config_claims: list[str] | None,
-    ) -> list[InstrumentId]:
-        if config_claims is None:
-            return []
-
-        order_claims: list[InstrumentId] = []
-
-        for instrument_id in config_claims:
-            if isinstance(instrument_id, str):
-                instrument_id = InstrumentId.from_str(instrument_id)
-            order_claims.append(instrument_id)
-
-        return order_claims
+    ) -> list[ExternalOrderClaim]:
+        return parse_external_order_claims(config_claims)
 
     def to_importable_config(self) -> ImportableStrategyConfig:
         """
@@ -1262,6 +1255,25 @@ cdef class Strategy(Actor):
             side=order_side,
         )
 
+        # With an explicit client, only that client's orders are canceled
+        # (a venue may have multiple clients, one per account)
+        cdef AccountId client_account_id = None
+        cdef Order client_order
+        if client_id is not None:
+            client_account_id = self._account_id_for_client(client_id)
+            open_orders = [
+                client_order for client_order in open_orders
+                if self._is_order_for_client(client_order, client_id, client_account_id)
+            ]
+            emulated_orders = [
+                client_order for client_order in emulated_orders
+                if self._is_order_for_client(client_order, client_id, client_account_id)
+            ]
+            inflight_orders = [
+                client_order for client_order in inflight_orders
+                if self._is_order_for_client(client_order, client_id, client_account_id)
+            ]
+
         cdef str order_side_str = " " + order_side_to_str(order_side) if order_side != OrderSide.NO_ORDER_SIDE else ""
         if not open_orders and not emulated_orders and not inflight_orders:
             self.log.info(
@@ -1454,11 +1466,18 @@ cdef class Strategy(Actor):
         # instrument_id can be None
         Condition.is_true(self.trader_id is not None, "The strategy has not been registered")
 
+        # With an explicit client, only positions of that client's account are closed
+        # (a venue may have multiple clients, one per account)
+        cdef AccountId client_account_id = None
+        if client_id is not None:
+            client_account_id = self._account_id_for_client(client_id)
+
         cdef list positions_open = self.cache.positions_open(
             venue=None,  # Faster query filtering
             instrument_id=instrument_id,
             strategy_id=self.id,
             side=position_side,
+            account_id=client_account_id,
         )
 
         cdef str position_side_str = " " + position_side_to_str(position_side) if position_side != PositionSide.NO_POSITION_SIDE else ""
@@ -2013,6 +2032,22 @@ cdef class Strategy(Actor):
             ts_event=ts_now,
             ts_init=ts_now,
         )
+
+    cdef AccountId _account_id_for_client(self, ClientId client_id):
+        # Accounts are indexed by their issuer, which equals the client ID
+        return self.cache.account_id(Venue(client_id.to_str()))
+
+    cdef bint _is_order_for_client(self, Order order, ClientId client_id, AccountId account_id):
+        if order.account_id is not None:
+            # Without the client's account, the order cannot be excluded
+            return account_id is None or order.account_id == account_id
+
+        cdef ClientId order_client_id = self.cache.client_id(order.client_order_id)
+        if order_client_id is not None:
+            return order_client_id == client_id
+
+        # Orders without an account or client are routed to the venue client
+        return client_id.to_str() == order.instrument_id.venue.to_str()
 
     cdef OrderPendingCancel _generate_order_pending_cancel(self, Order order):
         cdef uint64_t ts_now = self._clock.timestamp_ns()

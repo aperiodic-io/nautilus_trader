@@ -171,6 +171,61 @@ class TestRiskEngineWithCashAccount:
         assert risk_engine.max_notionals_per_order() == {_GBPUSD_SIM.id: Decimal(2000000)}
         assert risk_engine.max_notional_per_order(_GBPUSD_SIM.id) == 2_000_000
 
+    def test_submit_order_to_freshly_attached_client_before_account_state_is_denied(self):
+        # Arrange - a fresh venue/client has registered but has not yet received its
+        # first account state (F9); this applies to a single-account venue too, not
+        # only a multi-account one
+        fresh_venue = Venue("SIM_FRESH")
+        fresh_client_id = ClientId(fresh_venue.value)
+
+        instrument = TestInstrumentProvider.default_fx_ccy("AUD/USD", fresh_venue)
+        self.cache.add_instrument(instrument)
+        self.cache.add_quote_tick(TestDataStubs.quote_tick(instrument=instrument))
+
+        fresh_client = MockExecutionClient(
+            client_id=fresh_client_id,
+            venue=fresh_venue,
+            account_type=AccountType.CASH,
+            base_currency=USD,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_client(fresh_client)
+        # No account state has been applied for fresh_venue yet
+
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+        order = strategy.order_factory.market(
+            instrument.id,
+            OrderSide.BUY,
+            Quantity.from_int(10_000),
+        )
+
+        submit_order = SubmitOrder(
+            trader_id=self.trader_id,
+            strategy_id=strategy.id,
+            position_id=None,
+            order=order,
+            command_id=UUID4(),
+            client_id=fresh_client_id,
+            ts_init=self.clock.timestamp_ns(),
+        )
+
+        # Act
+        self.risk_engine.execute(submit_order)
+
+        # Assert - denied rather than silently passed through with no risk check
+        assert order.status == OrderStatus.DENIED
+        assert "ACCOUNT_NOT_FOUND" in order.last_event.reason
+
     def test_risk_engine_on_stop(self):
         # Arrange, Act
         self.risk_engine.start()
@@ -3641,6 +3696,182 @@ class TestRiskEngineWithCashAccount:
 
         # Assert
         assert order.status == OrderStatus.DENIED
+
+    def _register_two_cash_accounts(self, second_free_usd: int) -> tuple[AccountId, AccountId]:
+        # Replace the single venue client with two accounts for the venue
+        # (a venue with multiple accounts has no client named after the venue)
+        self.exec_engine.deregister_client(self.exec_client)
+        account_ids = []
+        for name, free_usd in (("SIM1", 1_000_000), ("SIM2", second_free_usd)):
+            client = MockExecutionClient(
+                client_id=ClientId(name),
+                venue=self.venue,
+                account_type=AccountType.CASH,
+                base_currency=USD,
+                msgbus=self.msgbus,
+                cache=self.cache,
+                clock=self.clock,
+            )
+            self.exec_engine.register_client(client)
+            account_id = AccountId(f"{name}-001")
+            self.portfolio.update_account(
+                AccountState(
+                    account_id=account_id,
+                    account_type=AccountType.CASH,
+                    base_currency=USD,
+                    reported=True,
+                    balances=[
+                        AccountBalance(
+                            Money(free_usd, USD),
+                            Money(0, USD),
+                            Money(free_usd, USD),
+                        ),
+                    ],
+                    margins=[],
+                    info={},
+                    event_id=UUID4(),
+                    ts_event=0,
+                    ts_init=0,
+                ),
+            )
+            account_ids.append(account_id)
+        return account_ids[0], account_ids[1]
+
+    def _registered_strategy(self) -> Strategy:
+        strategy = Strategy()
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        return strategy
+
+    def test_submit_order_with_client_id_checks_free_balance_of_client_account(self):
+        # Arrange
+        self._register_two_cash_accounts(second_free_usd=100)
+        self.exec_engine.start()
+        strategy = self._registered_strategy()
+        self.cache.add_quote_tick(TestDataStubs.quote_tick(instrument=_AUDUSD_SIM))
+
+        funded_order = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        underfunded_order = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        # Act
+        strategy.submit_order(funded_order, client_id=ClientId("SIM1"))
+        strategy.submit_order(underfunded_order, client_id=ClientId("SIM2"))
+
+        # Assert
+        assert funded_order.status == OrderStatus.INITIALIZED
+        assert underfunded_order.status == OrderStatus.DENIED
+        assert self.exec_engine.command_count == 1
+
+    def test_submit_sell_order_on_account_without_long_position_is_balance_checked(self):
+        # Arrange
+        account1, _ = self._register_two_cash_accounts(second_free_usd=100)
+        self.exec_engine.start()
+        strategy = self._registered_strategy()
+        self.cache.add_quote_tick(TestDataStubs.quote_tick(instrument=_AUDUSD_SIM))
+
+        # Open a LONG position on the first account
+        entry_order = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        strategy.submit_order(entry_order, client_id=ClientId("SIM1"))
+        self.exec_engine.process(TestEventStubs.order_submitted(entry_order, account_id=account1))
+        self.exec_engine.process(TestEventStubs.order_accepted(entry_order, account_id=account1))
+        self.exec_engine.process(
+            TestEventStubs.order_filled(entry_order, _AUDUSD_SIM, account_id=account1),
+        )
+        assert len(self.cache.positions_open()) == 1
+
+        exit_order = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+        )
+
+        # Act - the LONG position on the first account does not reduce on the second
+        strategy.submit_order(exit_order, client_id=ClientId("SIM2"))
+
+        # Assert
+        assert exit_order.status == OrderStatus.DENIED
+        assert self.exec_engine.command_count == 1
+
+    def test_submit_order_without_client_id_on_multi_account_venue_is_denied(self):
+        # Arrange
+        self._register_two_cash_accounts(second_free_usd=1_000_000)
+        self.exec_engine.start()
+        strategy = self._registered_strategy()
+        self.cache.add_quote_tick(TestDataStubs.quote_tick(instrument=_AUDUSD_SIM))
+        order = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        # Act
+        strategy.submit_order(order)
+
+        # Assert - no default account
+        assert order.status == OrderStatus.DENIED
+        assert "AMBIGUOUS_ACCOUNT" in order.last_event.reason
+
+    def test_reducing_state_uses_net_position_of_order_account(self):
+        # Arrange - LONG on the first account, SHORT (larger) on the second
+        account1, account2 = self._register_two_cash_accounts(second_free_usd=1_000_000)
+        self.exec_engine.start()
+        strategy = self._registered_strategy()
+        self.cache.add_quote_tick(TestDataStubs.quote_tick(instrument=_AUDUSD_SIM))
+        for client_id, account_id, side, qty in (
+            ("SIM1", account1, OrderSide.BUY, 100_000),
+            ("SIM2", account2, OrderSide.SELL, 200_000),
+        ):
+            order = strategy.order_factory.market(_AUDUSD_SIM.id, side, Quantity.from_int(qty))
+            strategy.submit_order(order, client_id=ClientId(client_id))
+            self.exec_engine.process(TestEventStubs.order_submitted(order, account_id=account_id))
+            self.exec_engine.process(TestEventStubs.order_accepted(order, account_id=account_id))
+            self.exec_engine.process(
+                TestEventStubs.order_filled(order, _AUDUSD_SIM, account_id=account_id),
+            )
+        self.risk_engine.set_trading_state(TradingState.REDUCING)
+
+        reduce_long = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.SELL,
+            Quantity.from_int(100_000),
+        )
+        increase_long = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+        reduce_short = strategy.order_factory.market(
+            _AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+        )
+
+        # Act - the aggregate across accounts is net SHORT, but each account is checked alone
+        strategy.submit_order(reduce_long, client_id=ClientId("SIM1"))
+        strategy.submit_order(increase_long, client_id=ClientId("SIM1"))
+        strategy.submit_order(reduce_short, client_id=ClientId("SIM2"))
+
+        # Assert
+        assert reduce_long.status == OrderStatus.INITIALIZED
+        assert increase_long.status == OrderStatus.DENIED
+        assert reduce_short.status == OrderStatus.INITIALIZED
 
 
 class TestRiskEngineWithBettingAccount:

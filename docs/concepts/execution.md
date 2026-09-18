@@ -252,6 +252,96 @@ engine settles those snapshots into the corrected history's own closed cycles an
 each cycle once. A void confined to the current cycle leaves the archive intact. See
 [Position snapshotting](positions.md#position-snapshotting).
 
+## Multiple accounts per venue
+
+A live node can register several execution clients for the same venue, one per account. A venue
+with multiple accounts has **no default account**: nothing is routed, risk-checked, or reconciled
+against an account the command does not resolve to.
+
+- A venue with a single client is unchanged: commands for its instruments route to that client.
+- A venue with multiple clients has no venue routing. No client may be named after the venue
+  (name each client for its account, for example `BINANCE1`, `BINANCE2`), a venue routing
+  override (`RoutingConfig.venues`) is rejected, and the default client is never used for it.
+- Client IDs of venue clients must not contain a hyphen, because the account ID issuer (the part
+  before the first `-`) must equal the client ID.
+
+The `ExecutionEngine` resolves the client (account) for a command in this order:
+
+1. An explicit `client_id` on the command.
+2. The client the order was submitted to (for modify, cancel, and query commands).
+3. The client of the order's account.
+4. The client of the account holding the position the order targets, so
+   `Strategy.close_position` routes to the account holding the position.
+5. For a single-account venue only, the venue's client, then the default client.
+
+On a venue with multiple accounts, an order that does not resolve to an account is denied with an
+`AMBIGUOUS_ACCOUNT` reason. A `CancelAllOrders` command without a `client_id` goes only to the
+clients (accounts) on which the strategy has working orders for the instrument, and a
+`BatchCancelOrders` command without a `client_id` is split by the account of each order. With an
+explicit `client_id`, `Strategy.cancel_all_orders` and `Strategy.close_all_positions` only act on
+the orders and positions of that client's account.
+
+Positions are kept separate per account. On a venue with multiple accounts, every `NETTING`
+position ID carries the client ID, `{instrument_id}-{strategy_id}-{client_id}`, so one strategy can
+hold a position on the same instrument in each account. The ID depends only on the client ID, not
+on registration order. The engine never applies a fill to a position of a different account.
+
+The `RiskEngine` checks orders against the account the `client_id` (or targeted position) resolves
+to, including the `REDUCING` trading state check. Portfolio and cache account lookups by venue
+return no account for a venue with multiple accounts; pass an `account_id`, for example
+`portfolio.account(account_id=AccountId("BINANCE2-USDT_FUTURES-master"))`.
+
+If a command names a `client_id` or targets a position whose account has not yet been resolved
+(for example immediately after that execution client attaches, before its first account state has
+been processed), the `RiskEngine` denies the order with an `ACCOUNT_NOT_FOUND` reason rather than
+passing it through with no balance or notional check. An order that does not target any specific
+account at all (no `client_id`, no `account_id`, and no execution client registered for the venue)
+still passes through the `RiskEngine` unchecked, so that downstream routing can deny it (for
+example with `AMBIGUOUS_ACCOUNT`) or a completely unconfigured venue can fail visibly further down
+the pipeline.
+
+Live reconciliation is scoped per account: a failed status query for one account does not cause
+the orders or positions of another account to be treated as missing, and fills are matched by
+account and trade ID, as both sides of a trade between two accounts share the venue trade ID.
+
+### Startup reconciliation and partial failure
+
+Startup reconciliation (before the node starts trading) is all-or-nothing by default: if any
+execution client fails to reconcile, the whole node's startup is aborted, exactly as when there is
+only one client. On a multi-account venue, set
+`LiveExecEngineConfig.reconciliation_startup_allow_partial_failure=True` to let the node start with
+the accounts that did reconcile, as long as at least one succeeded. The accounts that failed are
+named in the log and in `LiveExecutionEngine.reconciliation_startup_failed_clients`; they are
+picked up by the continuous (post-startup) reconciliation loop once their connectivity or API
+issue clears. If every client fails, startup is aborted regardless of this setting.
+
+### External order claims on a multi-account venue
+
+`StrategyConfig.external_order_claims` also has no default account on a multi-account venue. A
+bare claim (`"ETHUSDT-PERP.BINANCE"`) is only ever applied when the venue has a single account.
+Registering a bare claim for an instrument whose venue already has multiple accounts raises
+`InvalidConfiguration` immediately, and attaching a second account for a venue that already has a
+bare claim registered for one of its instruments raises `ValueError` and refuses to register that
+client. Either way the venue never silently drops a claim once a second account joins, because
+that would leave the claiming strategy's prior-attempt orders unclaimed on restart with nothing to
+cancel them. Scope the claim explicitly instead:
+
+- `"ETHUSDT-PERP.BINANCE@BINANCE2"` claims that instrument for the `BINANCE2` account only.
+- `"ETHUSDT-PERP.BINANCE@*"` claims it for every account of the venue (an explicit opt-in).
+
+```python
+config = StrategyConfig(
+    external_order_claims=[
+        "ETHUSDT-PERP.BINANCE@BINANCE1",
+        "ETHUSDT-PERP.BINANCE@BINANCE2",
+    ],
+)
+```
+
+Two claims for the same instrument conflict unless both are account-scoped to different accounts;
+a wildcard or bare claim covers every account of that instrument, so it conflicts with any other
+claim already registered for it.
+
 ## Risk engine
 
 The `RiskEngine` is a component of every Nautilus system, including backtest, sandbox, and live

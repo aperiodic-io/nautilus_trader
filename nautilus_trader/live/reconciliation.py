@@ -431,6 +431,19 @@ def create_order_filled_event(
     )
 
 
+def _external_position_id(
+    instrument: Instrument,
+    client: ExecutionClient | None,
+) -> PositionId:
+    # The fallback position ID is suffixed with the client ID for a venue client not
+    # named after the venue (an account of a venue with multiple accounts), so that
+    # fills of multiple accounts for the same instrument remain separate
+    if client is not None and client.venue is not None and client.id.value != client.venue.value:
+        return PositionId(f"{instrument.id}-EXTERNAL-{client.id}")
+
+    return PositionId(f"{instrument.id}-EXTERNAL")
+
+
 def create_inferred_order_filled_event(
     order: Order,
     ts_now: int,
@@ -507,7 +520,7 @@ def create_inferred_order_filled_event(
     if commission is None:
         commission = Money(0, instrument.quote_currency)
 
-    position_id = report.venue_position_id or PositionId(f"{instrument.id}-EXTERNAL")
+    position_id = report.venue_position_id or _external_position_id(instrument, client)
     pyo3_trade_id = nautilus_pyo3.create_inferred_reconciliation_trade_id(
         nautilus_pyo3.AccountId(report.account_id.value),
         nautilus_pyo3.InstrumentId.from_str(report.instrument_id.value),

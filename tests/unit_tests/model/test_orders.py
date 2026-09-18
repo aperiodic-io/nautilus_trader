@@ -37,6 +37,7 @@ from nautilus_trader.model.events import OrderDenied
 from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.events import OrderInitialized
 from nautilus_trader.model.events import OrderUpdated
+from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import ExecAlgorithmId
 from nautilus_trader.model.identifiers import OrderListId
@@ -2106,6 +2107,22 @@ class TestOrders:
             repr(order)
             == "MarketOrder(BUY 100_000 AUD/USD.SIM MARKET GTC, status=ACCEPTED, client_order_id=O-19700101-000000-000-001-1, venue_order_id=1, position_id=None, tags=None)"
         )
+
+    def test_apply_order_accepted_event_without_submission_sets_account_id(self):
+        # Arrange - external orders (e.g. from reconciliation) are accepted without submission
+        order = self.order_factory.limit(
+            AUDUSD_SIM.id,
+            OrderSide.BUY,
+            Quantity.from_int(100_000),
+            Price.from_str("1.00000"),
+        )
+
+        # Act
+        order.apply(TestEventStubs.order_accepted(order, account_id=AccountId("SIM2-001")))
+
+        # Assert
+        assert order.status == OrderStatus.ACCEPTED
+        assert order.account_id == AccountId("SIM2-001")
 
     def test_apply_order_rejected_event(self):
         # Arrange

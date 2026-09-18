@@ -21,6 +21,7 @@ from nautilus_trader.adapters.binance.common.enums import BinanceFuturesPosition
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderSide
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderType
 from nautilus_trader.adapters.binance.common.enums import BinanceTimeInForce
+from nautilus_trader.adapters.binance.common.positions import make_venue_position_id
 from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesEnumParser
 from nautilus_trader.core.datetime import millis_to_nanos
 from nautilus_trader.core.uuid import UUID4
@@ -179,6 +180,7 @@ class BinanceFuturesPositionRisk(msgspec.Struct, kw_only=True, frozen=True):
         enum_parser: BinanceFuturesEnumParser,
         report_id: UUID4,
         ts_init: int,
+        is_multi_account: bool = False,
     ) -> PositionStatusReport:
         net_size = Decimal(self.positionAmt)
 
@@ -193,7 +195,12 @@ class BinanceFuturesPositionRisk(msgspec.Struct, kw_only=True, frozen=True):
                 if self.positionSide == BinanceFuturesPositionSide.LONG
                 else PositionSide.SHORT
             )
-            venue_position_id = PositionId(f"{instrument_id}-{self.positionSide.value}")
+            venue_position_id = make_venue_position_id(
+                instrument_id,
+                self.positionSide.value,
+                account_id,
+                is_multi_account,
+            )
         else:
             position_side = enum_parser.parse_futures_position_side(net_size)
 

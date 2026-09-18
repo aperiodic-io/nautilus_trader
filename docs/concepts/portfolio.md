@@ -34,30 +34,49 @@ exposure = portfolio.net_exposures(venue=BINANCE, account_id=account_id)
 
 ### Multi-account behavior
 
-When querying multiple accounts simultaneously, behavior depends on whether you query
-all instruments (`net_exposures()`) or a single instrument (`net_exposure()`):
-
-**For `net_exposures()` (all instruments):**
-
-- **Same base currency**: Automatically converts to the common base currency.
-- **Different base currencies**: Returns a dict with multiple currencies, each converted
-  to its account's base currency. Provide `target_currency` for single-currency results.
-
-**For `net_exposure()` (single instrument across accounts):**
-
-- **Different base currencies**: Returns `None` unless you provide `target_currency`.
+A venue with more than one account (for example two Binance accounts trading under
+separate API keys) has **no default account**. Querying `net_exposure(s)` or
+`mark_values` by `venue` alone, with no `account_id`, never silently combines two
+accounts' exposure: netting a long position on one account against a short on another
+would cancel out and hide real risk, so these calls log an error and return `None`
+instead of guessing. This holds even when both accounts share the same base currency.
 
 ```python
-# Scenario 1: Multiple accounts, all with USD base currency
+# A venue with two accounts, no account_id given
 exposures = portfolio.net_exposures(venue=BINANCE)
-# Returns {USD: Money(...)}
+# Returns None and logs an error - there is no default account to aggregate across
+```
 
-# Scenario 2: Multiple accounts with different base currencies (USD and EUR)
-exposures = portfolio.net_exposures(venue=BINANCE)
-# Returns {USD: Money(...), EUR: Money(...)}
+Query one account explicitly, or discover every account of a venue and query each in
+turn:
 
-# Force single currency across accounts
-exposures = portfolio.net_exposures(venue=BINANCE, target_currency=USD)
+```python
+# Query one account's exposure explicitly
+exposures = portfolio.net_exposures(venue=BINANCE, account_id=account_id)
+
+# Discover every account of a venue, and query each one
+for account_id in portfolio.account_ids(BINANCE):
+    print(account_id, portfolio.net_exposures(venue=BINANCE, account_id=account_id))
+```
+
+`Portfolio.net_position_by_account(instrument_id)` gives the equivalent per-account
+breakdown for net position, without querying each account individually.
+
+PnL aggregation is unaffected by this rule: `realized_pnl(s)`, `unrealized_pnl(s)`, and
+`total_pnl(s)` still sum across every account by default (summing profit and loss across
+accounts is mathematically valid, unlike netting exposure, which can cancel opposite
+positions):
+
+```python
+# Multiple accounts: PnL sums across them by default
+pnls = portfolio.unrealized_pnls(venue=BINANCE)
+# Returns {USDT: Money(...)}
+
+# Query one account's PnL explicitly
+pnl = portfolio.unrealized_pnl(instrument_id, account_id=account_id)
+
+# Force a single currency across accounts (see "Conversion failures" below)
+pnls = portfolio.unrealized_pnls(venue=BINANCE, target_currency=USD)
 # Returns {USD: Money(...)}
 ```
 

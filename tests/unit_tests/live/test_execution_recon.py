@@ -58,6 +58,7 @@ from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.orders import Order
 from nautilus_trader.model.position import Position
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.mocks.exec_clients import MockLiveExecutionClient
@@ -2483,7 +2484,7 @@ class TestReconciliationEdgeCases:
         strategy_id = StrategyId("S-CLAIM")
         self.cache.add_instrument(instrument)
         live_exec_engine.generate_missing_orders = True
-        live_exec_engine._external_order_claims[instrument.id] = strategy_id
+        live_exec_engine._external_order_claims_any[instrument.id] = (strategy_id, False)
 
         report = PositionStatusReport(
             account_id=TestIdStubs.account_id(),
@@ -3666,6 +3667,130 @@ async def test_query_position_status_reports_handles_exceptions(live_exec_engine
     # Assert
     assert len(venue_positions) == 0
     assert failed_venues == {exec_client.venue}
+
+
+@pytest.mark.asyncio
+async def test_query_position_status_reports_scopes_failure_to_account_for_multi_client_venue(
+    event_loop,
+    live_exec_engine,
+    cache,
+):
+    # Arrange - a venue with multiple accounts (no client is named after the venue)
+    clock = LiveClock()
+    exec_client, secondary_client = (
+        MockLiveExecutionClient(
+            loop=event_loop,
+            client_id=ClientId(name),
+            venue=Venue("SIM"),
+            account_type=AccountType.CASH,
+            base_currency=USD,
+            instrument_provider=InstrumentProvider(),
+            msgbus=MessageBus(trader_id=TestIdStubs.trader_id(), clock=clock),
+            cache=cache,
+            clock=clock,
+        )
+        for name in ("SIM1", "SIM2")
+    )
+    live_exec_engine.register_client(exec_client)
+    live_exec_engine.register_client(secondary_client)
+
+    async def raise_error(command):
+        raise RuntimeError("API error")
+
+    secondary_client.generate_position_status_reports = raise_error
+
+    # Act
+    _, failed = await live_exec_engine._query_position_status_reports()
+
+    # Assert
+    assert failed == {secondary_client.account_id}
+    assert live_exec_engine._did_position_status_query_fail(
+        AUDUSD_SIM.id,
+        failed,
+        secondary_client.account_id,
+    )
+    assert not live_exec_engine._did_position_status_query_fail(
+        AUDUSD_SIM.id,
+        failed,
+        exec_client.account_id,
+    )
+
+
+def _filled_order(account_id: AccountId, venue_order_id: str) -> Order:
+    order = TestExecStubs.limit_order(
+        instrument=AUDUSD_SIM,
+        order_side=OrderSide.BUY,
+        price=Price.from_str("1.00000"),
+        quantity=Quantity.from_int(100_000),
+    )
+    order.apply(TestEventStubs.order_submitted(order, account_id=account_id))
+    order.apply(
+        TestEventStubs.order_accepted(
+            order,
+            account_id=account_id,
+            venue_order_id=VenueOrderId(venue_order_id),
+        ),
+    )
+    order.apply(
+        TestEventStubs.order_filled(
+            order,
+            instrument=AUDUSD_SIM,
+            account_id=account_id,
+            last_px=Price.from_str("1.00000"),
+        ),
+    )
+    return order
+
+
+def test_find_matching_cached_order_scoped_to_account(live_exec_engine, cache):
+    # Arrange
+    primary_order = _filled_order(AccountId("SIM-001"), "1")
+    cache.add_order(primary_order)
+
+    # Act
+    unscoped = live_exec_engine._find_matching_cached_order(
+        instrument_id=AUDUSD_SIM.id,
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_int(100_000),
+        price=Price.from_str("1.00000"),
+        avg_px=None,
+    )
+    other_account = live_exec_engine._find_matching_cached_order(
+        instrument_id=AUDUSD_SIM.id,
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_int(100_000),
+        price=Price.from_str("1.00000"),
+        avg_px=None,
+        account_id=AccountId("SIM2-001"),
+    )
+
+    # Assert
+    assert unscoped == primary_order
+    assert other_account is None
+
+
+def test_find_order_by_venue_order_id_scoped_to_account(live_exec_engine, cache):
+    # Arrange
+    primary_order = _filled_order(AccountId("SIM-001"), "1")
+    cache.add_order(primary_order)
+
+    # Act
+    same_account = live_exec_engine._find_order_by_venue_order_id(
+        venue_order_id=VenueOrderId("1"),
+        instrument_id=AUDUSD_SIM.id,
+        order_side=OrderSide.BUY,
+        account_id=AccountId("SIM-001"),
+    )
+    other_account = live_exec_engine._find_order_by_venue_order_id(
+        venue_order_id=VenueOrderId("1"),
+        instrument_id=AUDUSD_SIM.id,
+        order_side=OrderSide.BUY,
+        account_id=AccountId("SIM2-001"),
+    )
+
+    # Assert
+    assert same_account == primary_order
+    assert other_account is None
 
 
 @pytest.mark.asyncio

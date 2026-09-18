@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from typing import Any
+from typing import NamedTuple
 
 import msgspec
 
@@ -26,8 +27,99 @@ from nautilus_trader.common.config import resolve_config_path
 from nautilus_trader.common.config import resolve_path
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.model.enums import TimeInForce
+from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import StrategyId
+
+
+class ExternalOrderClaim(NamedTuple):
+    """
+    A parsed `external_order_claims` entry.
+
+    Parameters
+    ----------
+    instrument_id : InstrumentId
+        The instrument ID being claimed.
+    client_id : ClientId, optional
+        The specific account (execution client) the claim is scoped to. ``None`` means
+        the claim was written without an `@` suffix (see `wildcard`).
+    wildcard : bool, default False
+        If the claim was written as an explicit `INSTRUMENT@*`, meaning it applies to
+        every account of the instrument's venue, including a venue with multiple
+        accounts. When `client_id` is ``None`` and `wildcard` is ``False`` (a bare
+        `INSTRUMENT` claim), the claim only applies on a venue with a single account;
+        a venue with multiple accounts has no default account, so a bare claim there is
+        not applied.
+
+    """
+
+    instrument_id: InstrumentId
+    client_id: ClientId | None = None
+    wildcard: bool = False
+
+
+def parse_external_order_claims(
+    config_claims: list[InstrumentId | str] | None,
+) -> list[ExternalOrderClaim]:
+    """
+    Parse `external_order_claims` config entries into `ExternalOrderClaim` objects.
+
+    Each entry is either an `InstrumentId`, a bare instrument string (for example
+    ``"ETHUSDT-PERP.BINANCE"``), or an account-scoped string with a single ``@``
+    suffix: ``"ETHUSDT-PERP.BINANCE@BINANCE2"`` claims that instrument for the
+    `BINANCE2` account only, and ``"ETHUSDT-PERP.BINANCE@*"`` claims it for every
+    account of the venue (an explicit wildcard).
+
+    Parameters
+    ----------
+    config_claims : list[InstrumentId | str], optional
+        The raw `external_order_claims` config value.
+
+    Returns
+    -------
+    list[ExternalOrderClaim]
+
+    Raises
+    ------
+    ValueError
+        If a string entry contains more than one `@`, or an empty account part.
+
+    """
+    if config_claims is None:
+        return []
+
+    claims: list[ExternalOrderClaim] = []
+
+    for entry in config_claims:
+        if isinstance(entry, InstrumentId):
+            claims.append(ExternalOrderClaim(entry, None, False))
+            continue
+
+        parts = entry.split("@")
+
+        if len(parts) == 1:
+            claims.append(ExternalOrderClaim(InstrumentId.from_str(parts[0]), None, False))
+        elif len(parts) == 2:
+            instrument_id = InstrumentId.from_str(parts[0])
+            account_part = parts[1]
+
+            if not account_part:
+                raise ValueError(
+                    f"Invalid external order claim {entry!r}: empty account part after '@' "
+                    "(use 'INSTRUMENT@CLIENT_ID' or 'INSTRUMENT@*')",
+                )
+
+            if account_part == "*":
+                claims.append(ExternalOrderClaim(instrument_id, None, True))
+            else:
+                claims.append(ExternalOrderClaim(instrument_id, ClientId(account_part), False))
+        else:
+            raise ValueError(
+                f"Invalid external order claim {entry!r}: expected at most one '@' "
+                "(use 'INSTRUMENT', 'INSTRUMENT@CLIENT_ID', or 'INSTRUMENT@*')",
+            )
+
+    return claims
 
 
 class StrategyConfig(NautilusConfig, kw_only=True, frozen=True):
@@ -48,10 +140,16 @@ class StrategyConfig(NautilusConfig, kw_only=True, frozen=True):
     oms_type : OmsType, optional
         The order management system type for the strategy. This will determine
         how the `ExecutionEngine` handles position IDs.
-    external_order_claims : list[InstrumentId], optional
+    external_order_claims : list[InstrumentId | str], optional
         The external order claim instrument IDs.
         External orders and reconciled position exposure for matching instrument IDs will be associated
         with (claimed by) the strategy.
+        Each entry is an `InstrumentId`, a bare instrument string (for example ``"ETHUSDT-PERP.BINANCE"``),
+        or an account-scoped string with a single ``@`` suffix. On a venue with a single execution client
+        (account), a bare claim behaves as before. On a venue with multiple execution clients (accounts),
+        there is no default account, so a bare claim is not applied there; use
+        ``"ETHUSDT-PERP.BINANCE@BINANCE2"`` to claim that instrument for one account only, or
+        ``"ETHUSDT-PERP.BINANCE@*"`` to claim it for every account of that venue.
     manage_contingent_orders : bool, default False
         If OTO, OCO, and OUO **open** contingent orders should be managed automatically by the strategy.
         Any emulated orders which are active local will be managed by the `OrderEmulator` instead.

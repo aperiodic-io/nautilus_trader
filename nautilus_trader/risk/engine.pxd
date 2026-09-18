@@ -28,6 +28,7 @@ from nautilus_trader.execution.messages cimport SubmitOrder
 from nautilus_trader.execution.messages cimport SubmitOrderList
 from nautilus_trader.execution.messages cimport TradingCommand
 from nautilus_trader.model.identifiers cimport AccountId
+from nautilus_trader.model.identifiers cimport ClientId
 from nautilus_trader.model.identifiers cimport InstrumentId
 from nautilus_trader.model.instruments.base cimport Instrument
 from nautilus_trader.model.objects cimport Price
@@ -87,8 +88,10 @@ cdef class RiskEngine(Component):
     cpdef bint _check_order(self, Instrument instrument, Order order)
     cpdef bint _check_order_price(self, Instrument instrument, Order order)
     cpdef bint _check_order_quantity(self, Instrument instrument, Order order)
-    cpdef bint _check_orders_risk(self, Instrument instrument, list orders)
-    cpdef bint _check_orders_risk_for_account(self, Instrument instrument, list orders, AccountId account_id)
+    cdef AccountId _resolve_account_id(self, TradingCommand command)
+    cdef AccountId _reducing_account_id(self, Order order, TradingCommand command)
+    cpdef bint _check_orders_risk(self, Instrument instrument, list orders, AccountId default_account_id=*, ClientId requested_client_id=*)
+    cpdef bint _check_orders_risk_for_account(self, Instrument instrument, list orders, AccountId account_id, ClientId requested_client_id=*)
     cpdef str _check_price(self, Instrument instrument, Price price)
     cpdef str _check_quantity(self, Instrument instrument, Quantity quantity, bint is_quote_quantity=*)
 

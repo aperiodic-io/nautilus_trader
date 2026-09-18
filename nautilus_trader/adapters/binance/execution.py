@@ -500,8 +500,14 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
 
     def _get_cache_active_symbols(self) -> set[str]:
         # Check cache for all active symbols
-        open_orders: list[Order] = self._cache.orders_open(venue=self.venue)
-        open_positions: list[Position] = self._cache.positions_open(venue=self.venue)
+        open_orders: list[Order] = self._cache.orders_open(
+            venue=self.venue,
+            account_id=self.account_id,
+        )
+        open_positions: list[Position] = self._cache.positions_open(
+            venue=self.venue,
+            account_id=self.account_id,
+        )
         active_symbols: set[str] = set()
         for o in open_orders:
             active_symbols.add(o.instrument_id.symbol.value)
@@ -659,6 +665,7 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
                 report_id=UUID4(),
                 ts_init=self._clock.timestamp_ns(),
                 use_position_ids=self._use_position_ids,
+                is_multi_account=self.is_multi_account_venue,
             )
             self._log.debug(f"Received {report}")
             reports.append(report)
@@ -1434,9 +1441,11 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
                 f"ignoring order_side={order_side_to_str(command.order_side)} and canceling all orders",
             )
 
+        # Scope to this client's account (a venue may have multiple accounts)
         open_orders_strategy: list[Order] = self._cache.orders_open(
             instrument_id=command.instrument_id,
             strategy_id=command.strategy_id,
+            account_id=self.account_id,
         )
 
         # Filter to only SUBMITTED since PENDING_CANCEL/UPDATE are already in orders_open
@@ -1445,6 +1454,7 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
             for o in self._cache.orders_inflight(
                 instrument_id=command.instrument_id,
                 strategy_id=command.strategy_id,
+                account_id=self.account_id,
             )
             if o.status == OrderStatus.SUBMITTED
         ]
@@ -1454,10 +1464,14 @@ class BinanceCommonExecutionClient(LiveExecutionClient):
         # Count total orders across all strategies (for multi-strategy safety check)
         open_orders_total_count = self._cache.orders_open_count(
             instrument_id=command.instrument_id,
+            account_id=self.account_id,
         )
         submitted_orders_total_count = sum(
             1
-            for o in self._cache.orders_inflight(instrument_id=command.instrument_id)
+            for o in self._cache.orders_inflight(
+                instrument_id=command.instrument_id,
+                account_id=self.account_id,
+            )
             if o.status == OrderStatus.SUBMITTED
         )
         total_orders_count = open_orders_total_count + submitted_orders_total_count

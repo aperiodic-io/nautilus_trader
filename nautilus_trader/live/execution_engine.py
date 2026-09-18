@@ -153,7 +153,9 @@ class LiveExecutionEngine(ExecutionEngine):
         self._order_local_activity_ns: dict[ClientOrderId, int] = {}
         self._position_local_activity_ns: dict[InstrumentAccountKey, int] = {}
         self._position_recon_retries: Counter[InstrumentAccountKey] = Counter()
-        self._recent_fills_cache: dict[TradeId, int] = {}  # TradeId -> timestamp_ns (TTL cache)
+        # (AccountId, TradeId) -> timestamp_ns (TTL cache); trade IDs are only unique per account
+        self._recent_fills_cache: dict[tuple[AccountId, TradeId], int] = {}
+        self._failed_order_query_clients: set[ClientId] = set()
         self._inferred_fill_ts: dict[ClientOrderId, int] = {}
         self._fill_application_audit: dict[ClientOrderId, list[tuple[TradeId, str, int]]] = {}
         self._startup_reconciliation_event: asyncio.Event = asyncio.Event()
@@ -208,7 +210,16 @@ class LiveExecutionEngine(ExecutionEngine):
         self.position_check_threshold_ms: int = config.position_check_threshold_ms
         self.position_check_retries: int = config.position_check_retries
         self.reconciliation_startup_delay_secs: float = config.reconciliation_startup_delay_secs
+        self.reconciliation_startup_allow_partial_failure: bool = (
+            config.reconciliation_startup_allow_partial_failure
+        )
         self.graceful_shutdown_on_exception: bool = config.graceful_shutdown_on_exception
+
+        # Execution clients (accounts) whose most recent startup reconciliation failed;
+        # only ever non-empty when reconciliation_startup_allow_partial_failure is True
+        # and at least one other client reconciled successfully. Cleared on the next
+        # successful reconciliation for a client.
+        self.reconciliation_startup_failed_clients: set[ClientId] = set()
 
         self._log.info(f"{config.reconciliation=}", LogColor.BLUE)
         self._log.info(f"{config.reconciliation_lookback_mins=}", LogColor.BLUE)
@@ -232,6 +243,7 @@ class LiveExecutionEngine(ExecutionEngine):
         self._log.info(f"{config.position_check_threshold_ms=}", LogColor.BLUE)
         self._log.info(f"{config.position_check_retries=}", LogColor.BLUE)
         self._log.info(f"{config.reconciliation_startup_delay_secs=}", LogColor.BLUE)
+        self._log.info(f"{config.reconciliation_startup_allow_partial_failure=}", LogColor.BLUE)
         self._log.info(f"{config.purge_closed_orders_interval_mins=}", LogColor.BLUE)
         self._log.info(f"{config.purge_closed_orders_buffer_mins=}", LogColor.BLUE)
         self._log.info(f"{config.purge_closed_positions_interval_mins=}", LogColor.BLUE)
@@ -726,6 +738,17 @@ class LiveExecutionEngine(ExecutionEngine):
                 self._clear_recon_tracking(order.client_order_id, drop_last_query=False)
                 continue
 
+            if self._client_for_order(order) is None:
+                # No execution client currently serves this order's account (for
+                # example the account has been detached): there is no venue to ask,
+                # so never spend retries on it or fabricate a resolution once they
+                # "run out". Leave it exactly as-is until the account is reattached.
+                self._log.warning(
+                    f"Cannot check in-flight status for {order.client_order_id!r}: no "
+                    f"execution client for account {order.account_id}",
+                )
+                continue
+
             last_query_ts = self._ts_last_query.get(order.client_order_id)
             if last_query_ts and ts_now - last_query_ts < self._inflight_check_threshold_ns:
                 self._log.debug(
@@ -849,7 +872,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
     async def _query_position_status_reports(
         self,
-    ) -> tuple[dict[InstrumentAccountKey, PositionStatusReport], set[Venue | None]]:
+    ) -> tuple[dict[InstrumentAccountKey, PositionStatusReport], set[Venue | AccountId | None]]:
         clients = list(self._clients.values())
 
         tasks = [
@@ -873,11 +896,16 @@ class LiveExecutionEngine(ExecutionEngine):
             return {}, {client.venue for client in clients}
 
         venue_positions: dict[InstrumentAccountKey, PositionStatusReport] = {}
-        failed_venues: set[Venue | None] = set()
+        failed_venues: set[Venue | AccountId | None] = set()
 
         for client, reports_or_exception in zip(clients, position_reports_all, strict=True):
             if isinstance(reports_or_exception, BaseException):
-                failed_venues.add(client.venue)
+                # Where a venue has multiple clients (accounts), scope the failure to the account
+                venue_client_count = sum(1 for c in clients if c.venue == client.venue)
+                if client.venue is not None and venue_client_count > 1 and client.account_id:
+                    failed_venues.add(client.account_id)
+                else:
+                    failed_venues.add(client.venue)
                 self._log.error(
                     f"Failed to generate position status reports for venue {client.venue}: "
                     f"{reports_or_exception}",
@@ -894,7 +922,7 @@ class LiveExecutionEngine(ExecutionEngine):
         self,
         positions_by_key: dict[InstrumentAccountKey, list[Position]],
         venue_positions: dict[InstrumentAccountKey, PositionStatusReport],
-        failed_position_report_venues: set[Venue | None] | None = None,
+        failed_position_report_venues: set[Venue | AccountId | None] | None = None,
     ) -> None:
         clients = self._clients.values()
 
@@ -904,6 +932,7 @@ class LiveExecutionEngine(ExecutionEngine):
             if venue_report is None and self._did_position_status_query_fail(
                 instrument_id,
                 failed_position_report_venues,
+                account_id,
             ):
                 self._log.warning(
                     f"Skipping position reconciliation for {instrument_id}: "
@@ -947,7 +976,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
             missing_fills, had_fill_query_errors = await self._query_and_find_missing_fills(
                 instrument_id,
-                clients,
+                self._clients_for_account_query(account_id, clients),
             )
 
             await self._reconcile_missing_fills(missing_fills, instrument_id)
@@ -1009,7 +1038,8 @@ class LiveExecutionEngine(ExecutionEngine):
     def _did_position_status_query_fail(
         self,
         instrument_id: InstrumentId,
-        failed_position_report_venues: set[Venue | None] | None,
+        failed_position_report_venues: set[Venue | AccountId | None] | None,
+        account_id: AccountId | None = None,
     ) -> bool:
         if not failed_position_report_venues:
             return False
@@ -1017,6 +1047,7 @@ class LiveExecutionEngine(ExecutionEngine):
         return (
             None in failed_position_report_venues
             or instrument_id.venue in failed_position_report_venues
+            or (account_id is not None and account_id in failed_position_report_venues)
         )
 
     def _create_flat_position_report(
@@ -1143,7 +1174,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
             missing_fills, had_fill_query_errors = await self._query_and_find_missing_fills(
                 instrument_id,
-                clients,
+                self._clients_for_account_query(account_id, clients),
             )
             await self._reconcile_missing_fills(missing_fills, instrument_id)
 
@@ -1217,22 +1248,37 @@ class LiveExecutionEngine(ExecutionEngine):
             fills = cast("list[FillReport]", fills_or_exception)
             venue_fills.extend(fills)
 
-        cached_fill_trade_ids: set[TradeId] = set()
+        # Trade IDs are only unique per account (both sides of a trade between two
+        # accounts share the venue trade ID), so fills are keyed by account
+        cached_fill_keys: set[tuple[AccountId, TradeId]] = set()
 
         for order in self._cache.orders(instrument_id=instrument_id):
             for event in order.events:
                 if isinstance(event, OrderFilled):
-                    cached_fill_trade_ids.add(event.trade_id)
+                    cached_fill_keys.add((event.account_id, event.trade_id))
 
         # Find missing fills (not in cache and not in recent fills cache)
         missing_fills = [
             fill
             for fill in venue_fills
-            if fill.trade_id not in cached_fill_trade_ids
-            and fill.trade_id not in self._recent_fills_cache
+            if (fill.account_id, fill.trade_id) not in cached_fill_keys
+            and (fill.account_id, fill.trade_id) not in self._recent_fills_cache
         ]
 
         return missing_fills, had_fill_query_errors
+
+    def _clients_for_account_query(
+        self,
+        account_id: AccountId | None,
+        clients: Iterable[ExecutionClient],
+    ) -> list[ExecutionClient]:
+        # Query only the account's client (when registered), so another account's
+        # query errors or fills do not affect this account's reconciliation
+        account_client = self._client_for_account(account_id)
+        if account_client is not None:
+            return [account_client]
+
+        return list(clients)
 
     async def _reconcile_missing_fills(
         self,
@@ -1270,14 +1316,14 @@ class LiveExecutionEngine(ExecutionEngine):
         # Remove expired fills from cache (default TTL: 60 seconds)
         ts_now = self._clock.timestamp_ns()
         ttl_ns = secs_to_nanos(ttl_secs)
-        expired_trade_ids = [
-            trade_id
-            for trade_id, ts_cached in self._recent_fills_cache.items()
+        expired_keys = [
+            key
+            for key, ts_cached in self._recent_fills_cache.items()
             if ts_now - ts_cached > ttl_ns
         ]
 
-        for trade_id in expired_trade_ids:
-            self._recent_fills_cache.pop(trade_id, None)
+        for key in expired_keys:
+            self._recent_fills_cache.pop(key, None)
 
     async def _check_orders_consistency(self) -> None:
         try:
@@ -1329,11 +1375,27 @@ class LiveExecutionEngine(ExecutionEngine):
 
                 return  # Can't reliably resolve missing orders in open_only mode
 
+            if self._failed_order_query_clients:
+                # Orders of clients whose query failed are unknown, not missing
+                all_order_ids = {
+                    client_order_id
+                    for client_order_id in all_order_ids
+                    if not self._is_order_of_failed_query_client(client_order_id)
+                }
+
             await self._handle_missing_orders_at_venue(all_order_ids, venue_reported_ids)
 
             self._validate_open_orders_consistency()
         except Exception as e:
             self._log.exception("Error in check_order_consistency", e)
+
+    def _is_order_of_failed_query_client(self, client_order_id: ClientOrderId) -> bool:
+        order = self._cache.order(client_order_id)
+        if order is None:
+            return False
+
+        client = self._client_for_order(order)
+        return client is not None and client.id in self._failed_order_query_clients
 
     def _validate_open_orders_consistency(self) -> None:
         for order in self._cache.orders_open():
@@ -1359,6 +1421,17 @@ class LiveExecutionEngine(ExecutionEngine):
             order = self._cache.order(client_order_id)
             if order is None:
                 self._log.error(f"{client_order_id!r} missing at venue and not found in cache")
+                continue
+
+            if self._client_for_order(order) is None:
+                # No execution client currently serves this order's account (for
+                # example the account has been detached): there is no venue to ask,
+                # so never fabricate a resolution for it. Leave it as-is until the
+                # account is reattached.
+                self._log.warning(
+                    f"Cannot check open-order status for {client_order_id!r}: no "
+                    f"execution client for account {order.account_id}",
+                )
                 continue
 
             # Check if order is too recent to reconcile (avoid race conditions)
@@ -1432,14 +1505,18 @@ class LiveExecutionEngine(ExecutionEngine):
         )
 
         client_id = self._cache.client_id(order.client_order_id)
-        if client_id is None:
+        client = self._clients.get(client_id) if client_id is not None else None
+        if client is None:
+            # Resolve the client from the order's account (e.g. reconciled orders
+            # have no cached client ID)
+            client = self._client_for_account(order.account_id)
+
+        if client is None:
             self._log.warning(
-                f"No client_id found for {order.client_order_id!r}, skipping targeted query",
+                f"No client found for {order.client_order_id!r}, skipping targeted query",
             )
             # Skip targeted query but proceed with resolution
         else:
-            client = self._clients.get(client_id)
-
             try:
                 query_ts = self._clock.timestamp_ns()
                 command = GenerateOrderStatusReport(
@@ -1551,7 +1628,7 @@ class LiveExecutionEngine(ExecutionEngine):
             minutes=self.open_check_lookback_mins,
         )
 
-        clients = self._clients.values()
+        clients = list(self._clients.values())
 
         tasks = [
             c.generate_order_status_reports(
@@ -1571,10 +1648,15 @@ class LiveExecutionEngine(ExecutionEngine):
         order_reports_all = await asyncio.gather(*tasks, return_exceptions=True)
         all_order_reports: list[OrderStatusReport] = []
 
-        for reports_or_exception in order_reports_all:
+        # Track clients whose query failed, so their orders are not treated as
+        # missing at the venue (a venue may have multiple clients, one per account)
+        self._failed_order_query_clients = set()
+
+        for client, reports_or_exception in zip(clients, order_reports_all, strict=True):
             if isinstance(reports_or_exception, BaseException):
+                self._failed_order_query_clients.add(client.id)
                 self._log.error(
-                    f"Failed to generate order status reports: {reports_or_exception}",
+                    f"Failed to generate order status reports for {client.id}: {reports_or_exception}",
                 )
                 continue
 
@@ -1700,40 +1782,47 @@ class LiveExecutionEngine(ExecutionEngine):
                 # Signal completion even with no clients
                 return True
 
-            results: list[bool] = []
+            results_by_client: dict[ClientId, bool] = {}
 
             # Request execution mass status report from clients
             reconciliation_lookback_mins: int | None = (
                 self.reconciliation_lookback_mins if self.reconciliation_lookback_mins > 0 else None
             )
+            client_ids = list(self._clients.keys())
             mass_status_coros = [
-                c.generate_mass_status(reconciliation_lookback_mins) for c in self._clients.values()
+                self._clients[cid].generate_mass_status(reconciliation_lookback_mins)
+                for cid in client_ids
             ]
             mass_status_all = await asyncio.gather(*mass_status_coros, return_exceptions=True)
 
             # Reconcile each mass status with the execution engine
-            for mass_status_or_exception in mass_status_all:
+            for client_id, mass_status_or_exception in zip(
+                client_ids,
+                mass_status_all,
+                strict=True,
+            ):
                 if isinstance(mass_status_or_exception, BaseException):
-                    self._log.error(f"Failed to generate mass status: {mass_status_or_exception}")
-                    results.append(False)
+                    self._log.error(
+                        f"Failed to generate mass status for {client_id}: {mass_status_or_exception}",
+                    )
+                    results_by_client[client_id] = False
                     continue
 
                 if mass_status_or_exception is None:
                     self._log.warning(
-                        "No execution mass status available for reconciliation "
+                        f"No execution mass status available for {client_id} "
                         "(likely due to an adapter client error when generating reports)",
                     )
-                    results.append(False)
+                    results_by_client[client_id] = False
                     continue
 
                 mass_status = cast("ExecutionMassStatus", mass_status_or_exception)
-                client_id = mass_status.client_id
                 # venue = mass_status.venue
                 result = self._reconcile_execution_mass_status(mass_status)
 
                 if not result and self.filter_position_reports:
                     self._log_reconciliation_result(client_id, result)
-                    results.append(result)
+                    results_by_client[client_id] = result
                     self._log.warning(
                         "`filter_position_reports` enabled, skipping further reconciliation",
                     )
@@ -1795,17 +1884,59 @@ class LiveExecutionEngine(ExecutionEngine):
                     result = result and all(position_results)
 
                 self._log_reconciliation_result(client_id, result)
-                results.append(result)
+                results_by_client[client_id] = result
 
                 self._msgbus.publish(
                     topic=f"reports.execution.{mass_status.venue}",
                     msg=mass_status,
                 )
 
-            return all(results)
+            return self._resolve_startup_reconciliation_result(results_by_client)
         finally:
             # Always signal completion to prevent continuous loop signal await hang
             self._startup_reconciliation_event.set()
+
+    def _resolve_startup_reconciliation_result(
+        self,
+        results_by_client: dict[ClientId, bool],
+    ) -> bool:
+        # Startup reconciliation is all-or-nothing by default: any client failing
+        # aborts the whole node's startup. With reconciliation_startup_allow_partial_failure,
+        # a multi-client node may start with the clients (accounts) that did reconcile,
+        # as long as at least one succeeded; the continuous reconciliation loop retries
+        # the failed ones once their connectivity or API issue clears. A single client
+        # failing is never "partial" - there is nothing else to fall back to.
+        failed_clients = {cid for cid, ok in results_by_client.items() if not ok}
+        self.reconciliation_startup_failed_clients = failed_clients
+
+        if not failed_clients:
+            return True
+
+        if len(failed_clients) == len(results_by_client):
+            self._log.error(
+                f"Startup reconciliation failed for all {len(results_by_client)} "
+                "execution client(s)",
+            )
+            return False
+
+        failed_str = ", ".join(sorted(cid.value for cid in failed_clients))
+
+        if not self.reconciliation_startup_allow_partial_failure:
+            self._log.error(
+                f"Startup reconciliation failed for {len(failed_clients)} of "
+                f"{len(results_by_client)} execution client(s): {failed_str}",
+            )
+            return False
+
+        self._log.error(
+            f"Startup reconciliation failed for {len(failed_clients)} of "
+            f"{len(results_by_client)} execution client(s): {failed_str}. Proceeding "
+            "because reconciliation_startup_allow_partial_failure=True; these account(s)' "
+            "state has not been verified at startup and will be retried by the continuous "
+            "reconciliation loop.",
+        )
+
+        return True
 
     def _log_reconciliation_result(self, value: ClientId | InstrumentId, result: bool) -> None:
         if result:
@@ -2209,6 +2340,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     venue_order_id=report.venue_order_id,
                     instrument_id=report.instrument_id,
                     order_side=None,  # Don't filter by side to find any matching order
+                    account_id=report.account_id,
                 )
 
                 if order is not None:
@@ -2669,6 +2801,7 @@ class LiveExecutionEngine(ExecutionEngine):
                 quantity=close_quantity,
                 price=close_price,
                 avg_px=close_avg_px,
+                account_id=report.account_id,
             )
 
             if matching_close_order:
@@ -2772,6 +2905,7 @@ class LiveExecutionEngine(ExecutionEngine):
                 quantity=open_quantity,
                 price=open_price,
                 avg_px=open_avg_px,
+                account_id=report.account_id,
             )
 
             if matching_open_order:
@@ -2897,6 +3031,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     quantity=diff_quantity,
                     price=reconciliation_price,
                     avg_px=avg_px,
+                    account_id=report.account_id,
                 )
 
             if matching_diff_order:
@@ -2963,6 +3098,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     quantity=diff_quantity,
                     price=None,
                     avg_px=None,
+                    account_id=report.account_id,
                 )
 
             if matching_diff_order:
@@ -3117,6 +3253,7 @@ class LiveExecutionEngine(ExecutionEngine):
                     venue_order_id=report.venue_order_id,
                     instrument_id=report.instrument_id,
                     order_side=report.order_side,
+                    account_id=report.account_id,
                 )
 
                 if cached_order is not None:
@@ -3493,8 +3630,11 @@ class LiveExecutionEngine(ExecutionEngine):
         if client_id is not None:
             client = self._clients.get(client_id)
 
+        if client is None and report.account_id is not None:
+            client = self._clients.get(ClientId(report.account_id.get_issuer()))
+
         if client is None:
-            client = self._routing_map.get(instrument.id.venue, self._default_client)
+            client = self._venue_client(instrument.id.venue)
 
         filled = create_inferred_order_filled_event(
             order=order,
@@ -3548,7 +3688,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
         # Check if any strategy has claimed external orders for this instrument
         # This allows strategies to resume managing existing orders on restart
-        strategy_id = self.get_external_order_claim(report.instrument_id)
+        strategy_id = self.get_external_order_claim(report.instrument_id, report.account_id)
 
         if strategy_id is None:
             # All unclaimed reconciliation uses EXTERNAL strategy ID
@@ -3725,7 +3865,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
         if isinstance(event, OrderFilled):
             ts_now = self._clock.timestamp_ns()
-            self._recent_fills_cache[event.trade_id] = ts_now
+            self._recent_fills_cache[(event.account_id, event.trade_id)] = ts_now
 
             # Stamp receipt time: a venue ts_event ahead of this clock would make
             # the grace delta negative and suppress the position check.
@@ -3770,6 +3910,7 @@ class LiveExecutionEngine(ExecutionEngine):
         quantity: Quantity,
         price: Price | None,
         avg_px: Decimal | None,
+        account_id: AccountId | None = None,
     ) -> Order | None:
         # Search cache for existing order matching reconciliation parameters
         cached_orders = self._cache.orders(
@@ -3779,6 +3920,9 @@ class LiveExecutionEngine(ExecutionEngine):
         )
 
         for cached_order in cached_orders:
+            if not self._is_order_for_account(cached_order, account_id):
+                continue
+
             # Check if order is filled and matches the parameters
             if cached_order.status != OrderStatus.FILLED:
                 continue
@@ -3807,6 +3951,7 @@ class LiveExecutionEngine(ExecutionEngine):
         venue_order_id: VenueOrderId,
         instrument_id: InstrumentId,
         order_side: OrderSide | None = None,
+        account_id: AccountId | None = None,
     ) -> Order | None:
         # Fallback search when venue_order_id index not built
         cached_orders = self._cache.orders(
@@ -3816,7 +3961,15 @@ class LiveExecutionEngine(ExecutionEngine):
         )
 
         for cached_order in cached_orders:
+            if not self._is_order_for_account(cached_order, account_id):
+                continue
+
             if cached_order.venue_order_id == venue_order_id:
                 return cached_order
 
         return None
+
+    @staticmethod
+    def _is_order_for_account(order: Order, account_id: AccountId | None) -> bool:
+        # Orders not yet assigned an account can match any account
+        return account_id is None or order.account_id is None or order.account_id == account_id

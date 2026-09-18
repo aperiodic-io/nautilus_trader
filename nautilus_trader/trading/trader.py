@@ -720,6 +720,7 @@ class Trader(Component):
         if strategy.is_running:
             strategy.stop()
 
+        self._exec_engine.deregister_external_order_claims(strategy)
         self._strategies.pop(strategy_id)
         deregister_component_clock(self._instance_id, strategy.clock)
 
@@ -760,6 +761,7 @@ class Trader(Component):
 
         for strategy in self._strategies.values():
             strategy.dispose()
+            self._exec_engine.deregister_external_order_claims(strategy)
             deregister_component_clock(self._instance_id, strategy.clock)
 
         self._strategies.clear()

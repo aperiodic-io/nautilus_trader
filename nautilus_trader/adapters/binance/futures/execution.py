@@ -292,6 +292,7 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
                 report_id=UUID4(),
                 enum_parser=self._futures_enum_parser,
                 ts_init=self._clock.timestamp_ns(),
+                is_multi_account=self.is_multi_account_venue,
             )
             self._log.debug(f"Received {report}")
             reports.append(report)

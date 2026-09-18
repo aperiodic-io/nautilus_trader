@@ -1215,7 +1215,7 @@ cdef class ExecAlgorithm(Actor):
                 order=order,
                 command_id=UUID4(),
                 ts_init=self.clock.timestamp_ns(),
-                position_id=primary.position_id,
+                position_id=position_id,
                 client_id=client_id,
             )
 

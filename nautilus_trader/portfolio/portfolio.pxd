@@ -84,10 +84,17 @@ cdef class Portfolio(PortfolioFacade):
     cpdef void on_order_event(self, OrderEvent event)
     cpdef void on_position_event(self, PositionEvent event)
 
+    # -- MULTI-ACCOUNT QUERIES --------------------------------------------------------------------------
+
+    cpdef set account_ids(self, Venue venue)
+    cpdef list accounts(self, Venue venue)
+    cpdef dict net_position_by_account(self, InstrumentId instrument_id)
+
     # -- INTERNAL -------------------------------------------------------------------------------------
 
     cdef void _update_account(self, AccountState event)
     cdef Account _get_account(self, Venue venue, AccountId account_id, str caller_name, str message=*)
+    cdef bint _log_ambiguous_venue_accounts(self, Venue venue, str caller_name)
     cdef Venue _accumulate_mark_values(self, Venue venue, AccountId account_id, dict values, set unpriced)
     cdef void _update_missing_price_state(self, Venue venue, set unpriced)
     cdef void _update_mark_xrate(self, Instrument instrument, double xrate, InstrumentId instrument_id)

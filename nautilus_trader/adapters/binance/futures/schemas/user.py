@@ -24,6 +24,7 @@ from nautilus_trader.adapters.binance.common.enums import BinanceOrderSide
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderStatus
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderType
 from nautilus_trader.adapters.binance.common.enums import BinanceTimeInForce
+from nautilus_trader.adapters.binance.common.positions import make_venue_position_id
 from nautilus_trader.adapters.binance.execution import BinanceCommonExecutionClient
 from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesEventType
 from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesPositionUpdateReason
@@ -347,8 +348,11 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
             )
 
             if exec_client.use_position_ids:
-                report.venue_position_id = PositionId(
-                    f"{instrument_id}-{self.ps.value}",
+                report.venue_position_id = make_venue_position_id(
+                    instrument_id,
+                    self.ps.value,
+                    exec_client.account_id,
+                    exec_client.is_multi_account_venue,
                 )
             exec_client._send_order_status_report(report)
             return
@@ -404,7 +408,12 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
             liq_venue_position_id: PositionId | None = None
 
             if exec_client.use_position_ids:
-                liq_venue_position_id = PositionId(f"{instrument_id}-{self.ps.value}")
+                liq_venue_position_id = make_venue_position_id(
+                    instrument_id,
+                    self.ps.value,
+                    exec_client.account_id,
+                    exec_client.is_multi_account_venue,
+                )
 
             # Note: We cannot use generate_order_filled without strategy_id and cached order
             # Send FillReport directly for exchange-generated liquidation/ADL orders
@@ -574,7 +583,12 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
             venue_position_id: PositionId | None = None
 
             if exec_client.use_position_ids:
-                venue_position_id = PositionId(f"{instrument_id}-{self.ps.value}")
+                venue_position_id = make_venue_position_id(
+                    instrument_id,
+                    self.ps.value,
+                    exec_client.account_id,
+                    exec_client.is_multi_account_venue,
+                )
 
             # Liquidations are always taker, regular trades use the 'm' field
             liquidity_side = (
@@ -1016,7 +1030,12 @@ class BinanceFuturesAlgoOrderData(msgspec.Struct, kw_only=True, frozen=True):
         venue_position_id: PositionId | None = None
 
         if exec_client.use_position_ids:
-            venue_position_id = PositionId(f"{instrument_id}-{self.ps.value}")
+            venue_position_id = make_venue_position_id(
+                instrument_id,
+                self.ps.value,
+                exec_client.account_id,
+                exec_client.is_multi_account_venue,
+            )
 
         exec_client.generate_order_filled(
             strategy_id=strategy_id,

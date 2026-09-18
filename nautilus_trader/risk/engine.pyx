@@ -60,8 +60,11 @@ from nautilus_trader.model.functions cimport order_type_to_str
 from nautilus_trader.model.functions cimport trading_state_to_str
 from nautilus_trader.model.functions cimport trailing_offset_type_to_str
 from nautilus_trader.model.identifiers cimport AccountId
+from nautilus_trader.model.identifiers cimport ClientId
 from nautilus_trader.model.identifiers cimport ComponentId
 from nautilus_trader.model.identifiers cimport InstrumentId
+from nautilus_trader.model.identifiers cimport PositionId
+from nautilus_trader.model.identifiers cimport Venue
 from nautilus_trader.model.instruments.base cimport Instrument
 from nautilus_trader.model.objects cimport Currency
 from nautilus_trader.model.objects cimport Money
@@ -449,7 +452,12 @@ cdef class RiskEngine(Component):
         if not self._check_order(instrument, order):
             return  # Denied
 
-        if not self._check_orders_risk(instrument, [order]):
+        if not self._check_orders_risk(
+            instrument,
+            [order],
+            self._resolve_account_id(command),
+            command.client_id,
+        ):
             return # Denied
 
         self._execution_gateway(instrument, command)
@@ -487,7 +495,12 @@ cdef class RiskEngine(Component):
                 return  # Denied
 
         cdef Instrument representative = instruments[command.instrument_id]
-        if not self._check_orders_risk(representative, order_list.orders):
+        if not self._check_orders_risk(
+            representative,
+            order_list.orders,
+            self._resolve_account_id(command),
+            command.client_id,
+        ):
             self._deny_order_list(order_list, f"OrderList {order_list.id.to_str()} DENIED")
             return  # Denied
 
@@ -503,6 +516,7 @@ cdef class RiskEngine(Component):
         # VALIDATE COMMAND
         ########################################################################
         cdef Order order = self._cache.order(command.client_order_id)
+        cdef AccountId account_id = None
 
         if order is None:
             self._log.error(
@@ -564,13 +578,14 @@ cdef class RiskEngine(Component):
             return  # Denied
         elif self.trading_state == TradingState.REDUCING:
             if command.quantity and command.quantity > order.quantity:
-                if order.is_buy_c() and self._portfolio.is_net_long(instrument.id):
+                account_id = self._reducing_account_id(order, None)
+                if order.is_buy_c() and self._portfolio.is_net_long(instrument.id, account_id):
                     self._reject_modify_order(
                         order=order,
                         reason="TradingState is REDUCING and update will increase exposure",
                     )
                     return  # Denied
-                elif order.is_sell_c() and self._portfolio.is_net_short(instrument.id):
+                elif order.is_sell_c() and self._portfolio.is_net_short(instrument.id, account_id):
                     self._reject_modify_order(
                         order=order,
                         reason="TradingState is REDUCING and update will increase exposure",
@@ -639,36 +654,79 @@ cdef class RiskEngine(Component):
 
         return True  # Passed
 
-    cpdef bint _check_orders_risk(self, Instrument instrument, list orders):
+    cdef AccountId _resolve_account_id(self, TradingCommand command):
+        # Resolve the account a command targets before the orders are assigned an
+        # account ID (on submission), for venues with multiple accounts
+        cdef AccountId account_id = None
+        cdef PositionId position_id = None
+        cdef Position position
+        if command.client_id is not None:
+            account_id = self._cache.account_id(Venue(command.client_id.value))
+            if account_id is not None:
+                return account_id
+
+        if isinstance(command, SubmitOrder):
+            position_id = (<SubmitOrder>command).position_id
+        elif isinstance(command, SubmitOrderList):
+            position_id = (<SubmitOrderList>command).position_id
+
+        if position_id is not None:
+            position = self._cache.position(position_id)
+            if position is not None:
+                return position.account_id
+
+        return None
+
+    cpdef bint _check_orders_risk(
+        self,
+        Instrument instrument,
+        list orders,
+        AccountId default_account_id = None,
+        ClientId requested_client_id = None,
+    ):
         ########################################################################
         # RISK CHECKS
         ########################################################################
 
         # Group orders by account_id to handle multiple accounts per instrument
+        # (orders not yet assigned an account use the account resolved for the command)
         cdef dict orders_by_account = {}  # type: dict[AccountId, list]
         cdef:
             Order order
             AccountId account_id
         for order in orders:
-            if order.account_id not in orders_by_account:
-                orders_by_account[order.account_id] = []
+            account_id = order.account_id if order.account_id is not None else default_account_id
+            if account_id not in orders_by_account:
+                orders_by_account[account_id] = []
 
-            orders_by_account[order.account_id].append(order)
+            orders_by_account[account_id].append(order)
 
         # Check each account group separately
         cdef list account_orders
         for account_id, account_orders in orders_by_account.items():
-            if not self._check_orders_risk_for_account(instrument, account_orders, account_id):
+            if not self._check_orders_risk_for_account(
+                instrument,
+                account_orders,
+                account_id,
+                requested_client_id,
+            ):
                 return False  # Denied
 
         return True  # All checks passed
 
-    cpdef bint _check_orders_risk_for_account(self, Instrument instrument, list orders, AccountId account_id):
+    cpdef bint _check_orders_risk_for_account(
+        self,
+        Instrument instrument,
+        list orders,
+        AccountId account_id,
+        ClientId requested_client_id = None,
+    ):
         # Check orders for a specific account (or venue-based lookup if account_id is None)
         cdef QuoteTick last_quote = None
         cdef TradeTick last_trade = None
         cdef Price last_px = None
         cdef Money free
+        cdef Order unresolved_order
 
         # Determine max notional
         cdef Money max_notional = None
@@ -682,11 +740,34 @@ cdef class RiskEngine(Component):
         cdef Account account = self._cache.account_for_venue(instrument.id.venue, account_id)
 
         if account is None:
+            if account_id is not None or requested_client_id is not None:
+                # A specific account or client was identified for these orders
+                # (through the command's client_id, a referenced position, an order
+                # already carrying an account_id, or an explicit routing client_id
+                # whose account has not resolved), but no account state has been
+                # received for it yet (for example, immediately after an execution
+                # client attaches but before its first account state has been
+                # processed). There is no default account to fall back on, so the
+                # free balance and net-position checks below cannot run; deny rather
+                # than silently letting the orders pass with no risk check at all.
+                target = account_id if account_id is not None else requested_client_id
+                for unresolved_order in orders:
+                    self._deny_order(
+                        order=unresolved_order,
+                        reason=f"ACCOUNT_NOT_FOUND: no account found for {target!r}",
+                    )
+
+                return False  # Denied
+
+            # No specific account or client could be identified at all (for example,
+            # the venue has no execution client registered, or none has connected
+            # yet); there is nothing to check risk against, so fall through and let
+            # downstream routing (which may itself deny, for example an ambiguous
+            # multi-account venue) handle these orders.
             self._log.debug(
-                f"Cannot find account for venue {instrument.id.venue} "
-                f"(account_id={account_id.get_issuer() if account_id is not None else None})"
+                f"Cannot find account for venue {instrument.id.venue}",
             )
-            return True  # TODO: Temporary early return until handling routing/multiple venues
+            return True
 
         if account.is_margin_account:
             return True  # TODO: Determine risk controls for margin
@@ -705,6 +786,7 @@ cdef class RiskEngine(Component):
             instrument.id,
             None,
             PositionSide.LONG,
+            account.id,
         )
         cdef Quantity net_long_qty = Quantity.zero_c(instrument.size_precision)
         cdef Position position
@@ -720,6 +802,7 @@ cdef class RiskEngine(Component):
             instrument.id,
             None,
             OrderSide.SELL,
+            account.id,
         )
         cdef Quantity submitted_sell_qty = Quantity.zero_c(instrument.size_precision)
         cdef Order open_order
@@ -1130,9 +1213,25 @@ cdef class RiskEngine(Component):
 
 # -- EGRESS ---------------------------------------------------------------------------------------
 
+    cdef AccountId _reducing_account_id(self, Order order, TradingCommand command):
+        # The account whose net position a REDUCING check applies to: the order's
+        # account, else the account the command resolves to, else the venue's
+        # primary account (None aggregates across accounts)
+        if order.account_id is not None:
+            return order.account_id
+
+        cdef AccountId account_id = None
+        if command is not None:
+            account_id = self._resolve_account_id(command)
+            if account_id is not None:
+                return account_id
+
+        return self._cache.account_id(order.instrument_id.venue)
+
     cpdef void _execution_gateway(self, Instrument instrument, TradingCommand command):
         # Check TradingState
         cdef Order order
+        cdef AccountId account_id = None
 
         if self.trading_state == TradingState.HALTED:
             if isinstance(command, SubmitOrder):
@@ -1150,14 +1249,15 @@ cdef class RiskEngine(Component):
         elif self.trading_state == TradingState.REDUCING:
             if isinstance(command, SubmitOrder):
                 order = command.order
+                account_id = self._reducing_account_id(order, command)
 
-                if order.is_buy_c() and self._portfolio.is_net_long(instrument.id):
+                if order.is_buy_c() and self._portfolio.is_net_long(instrument.id, account_id):
                     self._deny_command(
                         command=command,
                         reason=f"BUY when TradingState.REDUCING and LONG {instrument.id}",
                     )
                     return  # Denied
-                elif order.is_sell_c() and self._portfolio.is_net_short(instrument.id):
+                elif order.is_sell_c() and self._portfolio.is_net_short(instrument.id, account_id):
                     self._deny_command(
                         command=command,
                         reason=f"SELL when TradingState.REDUCING and SHORT {instrument.id}",
@@ -1165,13 +1265,14 @@ cdef class RiskEngine(Component):
                     return  # Denied
             elif isinstance(command, SubmitOrderList):
                 for order in command.order_list.orders:
-                    if order.is_buy_c() and self._portfolio.is_net_long(order.instrument_id):
+                    account_id = self._reducing_account_id(order, command)
+                    if order.is_buy_c() and self._portfolio.is_net_long(order.instrument_id, account_id):
                         self._deny_order_list(
                             order_list=command.order_list,
                             reason=f"OrderList contains BUY when TradingState.REDUCING and LONG {order.instrument_id}",
                         )
                         return  # Denied
-                    elif order.is_sell_c() and self._portfolio.is_net_short(order.instrument_id):
+                    elif order.is_sell_c() and self._portfolio.is_net_short(order.instrument_id, account_id):
                         self._deny_order_list(
                             order_list=command.order_list,
                             reason=f"OrderList contains SELL when TradingState.REDUCING and SHORT {order.instrument_id}",

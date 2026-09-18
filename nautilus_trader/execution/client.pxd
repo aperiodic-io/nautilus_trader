@@ -63,11 +63,20 @@ cdef class ExecutionClient(Component):
     """The clients account base currency (None for multi-currency accounts).\n\n:returns: `Currency` or ``None``"""
     cdef readonly bint is_connected
     """If the client is connected.\n\n:returns: `bool`"""
+    cdef readonly bint is_multi_account_venue
+    """If the client's venue currently has more than one execution client
+    (account) registered with the execution engine. Set by the engine on
+    registration and deregistration; adapters use this instead of comparing
+    `account_id.get_issuer()` to `venue` to decide whether venue-reported
+    identifiers (for example a hedge-mode position ID) need an account suffix,
+    so a solo client is never suffixed regardless of its name.
+    \n\n:returns: `bool`"""
 
     cpdef Account get_account(self)
     cpdef Money calculate_commission(self, Instrument instrument, Quantity last_qty, Price last_px, LiquiditySide liquidity_side)
 
     cpdef void _set_connected(self, bint value=*)
+    cpdef void _set_multi_account_venue(self, bint value)
     cpdef void _set_account_id(self, AccountId account_id)
 
 # -- COMMAND HANDLERS -----------------------------------------------------------------------------
