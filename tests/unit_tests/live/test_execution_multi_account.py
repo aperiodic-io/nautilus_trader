@@ -23,6 +23,7 @@ import pytest
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.providers import InstrumentProvider
+from nautilus_trader.config import LiveExecEngineConfig
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import CancelOrder
@@ -895,3 +896,169 @@ class TestLiveReconciliationExternalOrderClaims:
 
         # Assert
         assert order.strategy_id == StrategyId("EXTERNAL")
+
+
+class TestStartupReconciliationPartialFailure:
+    """
+    Startup reconciliation is a single all-or-nothing gate by default: one failing
+    execution client (account) aborts the whole node's startup, even when other
+    accounts reconciled successfully and have nothing to do with the failure.
+    `reconciliation_startup_allow_partial_failure` lets a multi-account node start with
+    the accounts that did reconcile, while the failed ones are retried by the ongoing
+    reconciliation loop; a single-account node (or a node where every account fails) is
+    completely unaffected, since there is nothing "partial" to allow in that case.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, request):
+        self.loop = request.getfixturevalue("event_loop")
+        self.clock = LiveClock()
+        self.trader_id = TestIdStubs.trader_id()
+        self.msgbus = MessageBus(trader_id=self.trader_id, clock=self.clock)
+        self.cache = TestComponentStubs.cache()
+        self.cache.add_instrument(AUDUSD_SIM)
+
+    def _make_engine(self, allow_partial_failure: bool) -> LiveExecutionEngine:
+        return LiveExecutionEngine(
+            loop=self.loop,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            config=LiveExecEngineConfig(
+                reconciliation_startup_allow_partial_failure=allow_partial_failure,
+            ),
+        )
+
+    def _make_client(self, client_id: ClientId) -> MockLiveExecutionClient:
+        return MockLiveExecutionClient(
+            loop=self.loop,
+            client_id=client_id,
+            venue=SIM,
+            account_type=AccountType.MARGIN,
+            base_currency=USD,
+            instrument_provider=InstrumentProvider(),
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_is_strict_all_or_nothing(self) -> None:
+        # Arrange - the default (False) preserves the exact prior behavior
+        async def raise_error(*_args, **_kwargs):
+            raise RuntimeError("API error")
+
+        engine = self._make_engine(allow_partial_failure=False)
+        healthy = self._make_client(FIRST_CLIENT_ID)
+        failing = self._make_client(SECOND_CLIENT_ID)
+        failing.generate_mass_status = raise_error  # type: ignore[method-assign]
+        engine.register_client(healthy)
+        engine.register_client(failing)
+
+        # Act
+        result = await engine.reconcile_execution_state()
+
+        # Assert
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_single_client_failure_is_not_partial(self) -> None:
+        # Arrange - a single-account node has nothing "partial" to allow: its one
+        # client failing must still abort, with or without the flag set
+        async def raise_error(*_args, **_kwargs):
+            raise RuntimeError("API error")
+
+        engine = self._make_engine(allow_partial_failure=True)
+        failing = self._make_client(FIRST_CLIENT_ID)
+        failing.generate_mass_status = raise_error  # type: ignore[method-assign]
+        engine.register_client(failing)
+
+        # Act
+        result = await engine.reconcile_execution_state()
+
+        # Assert
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_all_clients_failing_still_aborts_with_flag_set(self) -> None:
+        # Arrange - every account failing leaves nothing healthy to start with
+        async def raise_error(*_args, **_kwargs):
+            raise RuntimeError("API error")
+
+        engine = self._make_engine(allow_partial_failure=True)
+        first = self._make_client(FIRST_CLIENT_ID)
+        second = self._make_client(SECOND_CLIENT_ID)
+        first.generate_mass_status = raise_error  # type: ignore[method-assign]
+        second.generate_mass_status = raise_error  # type: ignore[method-assign]
+        engine.register_client(first)
+        engine.register_client(second)
+
+        # Act
+        result = await engine.reconcile_execution_state()
+
+        # Assert
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_one_failing_account_does_not_block_the_other_when_flag_set(self) -> None:
+        # Arrange
+        async def raise_error(*_args, **_kwargs):
+            raise RuntimeError("API error")
+
+        engine = self._make_engine(allow_partial_failure=True)
+        healthy = self._make_client(FIRST_CLIENT_ID)
+        failing = self._make_client(SECOND_CLIENT_ID)
+        failing.generate_mass_status = raise_error  # type: ignore[method-assign]
+        engine.register_client(healthy)
+        engine.register_client(failing)
+
+        # Act
+        result = await engine.reconcile_execution_state()
+
+        # Assert - the node can start; the failed account is named for follow-up
+        assert result is True
+        assert engine.reconciliation_startup_failed_clients == {SECOND_CLIENT_ID}
+
+    @pytest.mark.asyncio
+    async def test_successful_reconciliation_clears_previously_failed_clients(self) -> None:
+        # Arrange - simulate a retry (e.g. reconnect) after a partial failure
+        async def raise_error(*_args, **_kwargs):
+            raise RuntimeError("API error")
+
+        engine = self._make_engine(allow_partial_failure=True)
+        first = self._make_client(FIRST_CLIENT_ID)
+        second = self._make_client(SECOND_CLIENT_ID)
+        original = second.generate_mass_status
+        second.generate_mass_status = raise_error  # type: ignore[method-assign]
+        engine.register_client(first)
+        engine.register_client(second)
+        await engine.reconcile_execution_state()
+        assert engine.reconciliation_startup_failed_clients == {SECOND_CLIENT_ID}
+
+        # Act - second client recovers
+        second.generate_mass_status = original  # type: ignore[method-assign]
+        result = await engine.reconcile_execution_state()
+
+        # Assert
+        assert result is True
+        assert engine.reconciliation_startup_failed_clients == set()
+
+    @pytest.mark.asyncio
+    async def test_returning_none_mass_status_is_treated_as_failure(self) -> None:
+        # Arrange - an adapter returning None (rather than raising) for one client
+        async def return_none(*_args, **_kwargs):
+            return None
+
+        engine = self._make_engine(allow_partial_failure=True)
+        healthy = self._make_client(FIRST_CLIENT_ID)
+        returns_none = self._make_client(SECOND_CLIENT_ID)
+        returns_none.generate_mass_status = return_none  # type: ignore[method-assign]
+        engine.register_client(healthy)
+        engine.register_client(returns_none)
+
+        # Act
+        result = await engine.reconcile_execution_state()
+
+        # Assert
+        assert result is True
+        assert engine.reconciliation_startup_failed_clients == {SECOND_CLIENT_ID}

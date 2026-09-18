@@ -295,6 +295,17 @@ Live reconciliation is scoped per account: a failed status query for one account
 the orders or positions of another account to be treated as missing, and fills are matched by
 account and trade ID, as both sides of a trade between two accounts share the venue trade ID.
 
+### Startup reconciliation and partial failure
+
+Startup reconciliation (before the node starts trading) is all-or-nothing by default: if any
+execution client fails to reconcile, the whole node's startup is aborted, exactly as when there is
+only one client. On a multi-account venue, set
+`LiveExecEngineConfig.reconciliation_startup_allow_partial_failure=True` to let the node start with
+the accounts that did reconcile, as long as at least one succeeded. The accounts that failed are
+named in the log and in `LiveExecutionEngine.reconciliation_startup_failed_clients`; they are
+picked up by the continuous (post-startup) reconciliation loop once their connectivity or API
+issue clears. If every client fails, startup is aborted regardless of this setting.
+
 ### External order claims on a multi-account venue
 
 `StrategyConfig.external_order_claims` also has no default account on a multi-account venue. A

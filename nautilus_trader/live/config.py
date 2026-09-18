@@ -166,6 +166,16 @@ class LiveExecEngineConfig(ExecEngineConfig, frozen=True):
         The additional delay (seconds) applied AFTER startup reconciliation
         completes before starting the continuous reconciliation loop. This provides time
         for additional system stabilization after initial reconciliation.
+    reconciliation_startup_allow_partial_failure : bool, default False
+        If startup reconciliation may succeed when some, but not all, execution clients
+        (accounts) fail to reconcile. When False (default), any client's startup
+        reconciliation failure aborts the whole node's startup, exactly as when there is
+        only one execution client - the safe default. When True and at least one client
+        reconciles successfully, startup proceeds; the accounts that failed are logged
+        and left for the continuous (post-startup) reconciliation loop to retry once
+        their connectivity or API issue clears. If every client fails, startup is
+        aborted regardless of this setting, since there is no account left to trust.
+        See `LiveExecutionEngine.reconciliation_startup_failed_clients`.
     qsize : PositiveInt, default 100_000
         The queue size for the engines internal queue buffers.
     graceful_shutdown_on_exception : bool, default False
@@ -197,6 +207,7 @@ class LiveExecEngineConfig(ExecEngineConfig, frozen=True):
     position_check_threshold_ms: NonNegativeInt = 5_000
     position_check_retries: NonNegativeInt = 3
     reconciliation_startup_delay_secs: PositiveFloat = 10.0
+    reconciliation_startup_allow_partial_failure: bool = False
     qsize: PositiveInt = 100_000
     graceful_shutdown_on_exception: bool = False
 

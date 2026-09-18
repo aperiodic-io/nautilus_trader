@@ -210,7 +210,16 @@ class LiveExecutionEngine(ExecutionEngine):
         self.position_check_threshold_ms: int = config.position_check_threshold_ms
         self.position_check_retries: int = config.position_check_retries
         self.reconciliation_startup_delay_secs: float = config.reconciliation_startup_delay_secs
+        self.reconciliation_startup_allow_partial_failure: bool = (
+            config.reconciliation_startup_allow_partial_failure
+        )
         self.graceful_shutdown_on_exception: bool = config.graceful_shutdown_on_exception
+
+        # Execution clients (accounts) whose most recent startup reconciliation failed;
+        # only ever non-empty when reconciliation_startup_allow_partial_failure is True
+        # and at least one other client reconciled successfully. Cleared on the next
+        # successful reconciliation for a client.
+        self.reconciliation_startup_failed_clients: set[ClientId] = set()
 
         self._log.info(f"{config.reconciliation=}", LogColor.BLUE)
         self._log.info(f"{config.reconciliation_lookback_mins=}", LogColor.BLUE)
@@ -234,6 +243,7 @@ class LiveExecutionEngine(ExecutionEngine):
         self._log.info(f"{config.position_check_threshold_ms=}", LogColor.BLUE)
         self._log.info(f"{config.position_check_retries=}", LogColor.BLUE)
         self._log.info(f"{config.reconciliation_startup_delay_secs=}", LogColor.BLUE)
+        self._log.info(f"{config.reconciliation_startup_allow_partial_failure=}", LogColor.BLUE)
         self._log.info(f"{config.purge_closed_orders_interval_mins=}", LogColor.BLUE)
         self._log.info(f"{config.purge_closed_orders_buffer_mins=}", LogColor.BLUE)
         self._log.info(f"{config.purge_closed_positions_interval_mins=}", LogColor.BLUE)
@@ -1750,40 +1760,47 @@ class LiveExecutionEngine(ExecutionEngine):
                 # Signal completion even with no clients
                 return True
 
-            results: list[bool] = []
+            results_by_client: dict[ClientId, bool] = {}
 
             # Request execution mass status report from clients
             reconciliation_lookback_mins: int | None = (
                 self.reconciliation_lookback_mins if self.reconciliation_lookback_mins > 0 else None
             )
+            client_ids = list(self._clients.keys())
             mass_status_coros = [
-                c.generate_mass_status(reconciliation_lookback_mins) for c in self._clients.values()
+                self._clients[cid].generate_mass_status(reconciliation_lookback_mins)
+                for cid in client_ids
             ]
             mass_status_all = await asyncio.gather(*mass_status_coros, return_exceptions=True)
 
             # Reconcile each mass status with the execution engine
-            for mass_status_or_exception in mass_status_all:
+            for client_id, mass_status_or_exception in zip(
+                client_ids,
+                mass_status_all,
+                strict=True,
+            ):
                 if isinstance(mass_status_or_exception, BaseException):
-                    self._log.error(f"Failed to generate mass status: {mass_status_or_exception}")
-                    results.append(False)
+                    self._log.error(
+                        f"Failed to generate mass status for {client_id}: {mass_status_or_exception}",
+                    )
+                    results_by_client[client_id] = False
                     continue
 
                 if mass_status_or_exception is None:
                     self._log.warning(
-                        "No execution mass status available for reconciliation "
+                        f"No execution mass status available for {client_id} "
                         "(likely due to an adapter client error when generating reports)",
                     )
-                    results.append(False)
+                    results_by_client[client_id] = False
                     continue
 
                 mass_status = cast("ExecutionMassStatus", mass_status_or_exception)
-                client_id = mass_status.client_id
                 # venue = mass_status.venue
                 result = self._reconcile_execution_mass_status(mass_status)
 
                 if not result and self.filter_position_reports:
                     self._log_reconciliation_result(client_id, result)
-                    results.append(result)
+                    results_by_client[client_id] = result
                     self._log.warning(
                         "`filter_position_reports` enabled, skipping further reconciliation",
                     )
@@ -1845,17 +1862,59 @@ class LiveExecutionEngine(ExecutionEngine):
                     result = result and all(position_results)
 
                 self._log_reconciliation_result(client_id, result)
-                results.append(result)
+                results_by_client[client_id] = result
 
                 self._msgbus.publish(
                     topic=f"reports.execution.{mass_status.venue}",
                     msg=mass_status,
                 )
 
-            return all(results)
+            return self._resolve_startup_reconciliation_result(results_by_client)
         finally:
             # Always signal completion to prevent continuous loop signal await hang
             self._startup_reconciliation_event.set()
+
+    def _resolve_startup_reconciliation_result(
+        self,
+        results_by_client: dict[ClientId, bool],
+    ) -> bool:
+        # Startup reconciliation is all-or-nothing by default: any client failing
+        # aborts the whole node's startup. With reconciliation_startup_allow_partial_failure,
+        # a multi-client node may start with the clients (accounts) that did reconcile,
+        # as long as at least one succeeded; the continuous reconciliation loop retries
+        # the failed ones once their connectivity or API issue clears. A single client
+        # failing is never "partial" - there is nothing else to fall back to.
+        failed_clients = {cid for cid, ok in results_by_client.items() if not ok}
+        self.reconciliation_startup_failed_clients = failed_clients
+
+        if not failed_clients:
+            return True
+
+        if len(failed_clients) == len(results_by_client):
+            self._log.error(
+                f"Startup reconciliation failed for all {len(results_by_client)} "
+                "execution client(s)",
+            )
+            return False
+
+        failed_str = ", ".join(sorted(cid.value for cid in failed_clients))
+
+        if not self.reconciliation_startup_allow_partial_failure:
+            self._log.error(
+                f"Startup reconciliation failed for {len(failed_clients)} of "
+                f"{len(results_by_client)} execution client(s): {failed_str}",
+            )
+            return False
+
+        self._log.error(
+            f"Startup reconciliation failed for {len(failed_clients)} of "
+            f"{len(results_by_client)} execution client(s): {failed_str}. Proceeding "
+            "because reconciliation_startup_allow_partial_failure=True; these account(s)' "
+            "state has not been verified at startup and will be retried by the continuous "
+            "reconciliation loop.",
+        )
+
+        return True
 
     def _log_reconciliation_result(self, value: ClientId | InstrumentId, result: bool) -> None:
         if result:
