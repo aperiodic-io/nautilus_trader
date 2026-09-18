@@ -1360,16 +1360,15 @@ node.build()
 
 The legacy v1 adapter can trade several OKX accounts (separate API keys) from one
 `TradingNode`. Each account runs its own execution client; one data client serves market data
-for all of them.
+for all of them. There is no default account: every order must resolve to an account.
 
-1. Keep the key `OKX` for the primary account. It keeps venue routing, so orders submitted
-   without a `client_id` go to it, and its account and position IDs are unchanged.
-2. Give each additional account a distinct key without a hyphen, such as `OKXB`. The node
-   builder only uses the part of a key before the first `-`, and the key becomes the client ID
-   and the account ID issuer (for example `OKXB-master`).
-3. Register the execution client factory under each key.
-4. Set `api_key`, `api_secret`, and `api_passphrase` explicitly for each additional account.
-   The environment variable fallback resolves a single set of credentials.
+1. Give each account a distinct key without a hyphen, such as `OKX1` and `OKX2`. No key may be
+   the venue name `OKX` when the venue has multiple accounts. The node builder only uses the part
+   of a key before the first `-`, and the key becomes the client ID and the account ID issuer (for
+   example `OKX2-master`).
+2. Register the execution client factory under each key.
+3. Set `api_key`, `api_secret`, and `api_passphrase` explicitly for each account. The environment
+   variable fallback resolves a single set of credentials.
 
 ```python
 config = TradingNodeConfig(
@@ -1378,31 +1377,32 @@ config = TradingNodeConfig(
         OKX: OKXDataClientConfig(instrument_types=(OKXInstrumentType.SWAP,)),
     },
     exec_clients={
-        OKX: OKXExecClientConfig(
-            api_key=None,  # Will use OKX_API_KEY env var
-            api_secret=None,  # Will use OKX_API_SECRET env var
-            api_passphrase=None,  # Will use OKX_API_PASSPHRASE env var
+        "OKX1": OKXExecClientConfig(
+            api_key=account1_api_key,
+            api_secret=account1_api_secret,
+            api_passphrase=account1_api_passphrase,
             instrument_types=(OKXInstrumentType.SWAP,),
         ),
-        "OKXB": OKXExecClientConfig(
-            api_key=account_b_api_key,
-            api_secret=account_b_api_secret,
-            api_passphrase=account_b_api_passphrase,
+        "OKX2": OKXExecClientConfig(
+            api_key=account2_api_key,
+            api_secret=account2_api_secret,
+            api_passphrase=account2_api_passphrase,
             instrument_types=(OKXInstrumentType.SWAP,),
         ),
     },
 )
 node = TradingNode(config=config)
 node.add_data_client_factory(OKX, OKXLiveDataClientFactory)
-node.add_exec_client_factory(OKX, OKXLiveExecClientFactory)
-node.add_exec_client_factory("OKXB", OKXLiveExecClientFactory)
+node.add_exec_client_factory("OKX1", OKXLiveExecClientFactory)
+node.add_exec_client_factory("OKX2", OKXLiveExecClientFactory)
 node.build()
 ```
 
-In the strategy, pass the client ID of an additional account when submitting orders:
+In the strategy, pass the client ID of the account when submitting orders. An order without a
+`client_id` (that does not target an existing position) is denied:
 
 ```python
-self.submit_order(order, client_id=ClientId("OKXB"))
+self.submit_order(order, client_id=ClientId("OKX2"))
 ```
 
 Modify, cancel, and close commands route to the account of the order or position they refer

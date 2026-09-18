@@ -550,7 +550,18 @@ cdef class OrderEmulator(Actor):
             )
 
         cdef Order order
+        cdef ClientId order_client_id
         for order in orders:
+            if command.client_id is not None:
+                # With an explicit client, only cancel orders for that client
+                # (orders without a client are routed to the venue client)
+                order_client_id = self.cache.client_id(order.client_order_id)
+                if order_client_id is None:
+                    if command.client_id.to_str() != order.instrument_id.venue.to_str():
+                        continue
+                elif order_client_id != command.client_id:
+                    continue
+
             self._manager.cancel_order(order)
 
     cpdef void _check_monitoring(self, StrategyId strategy_id, PositionId position_id):

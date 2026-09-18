@@ -65,12 +65,12 @@ def _okx_exec_config(n: int) -> OKXExecClientConfig:
 
 
 def _binance_key(n: int) -> str:
-    # The first account keeps the venue name so it keeps the venue routing
-    return "BINANCE" if n == 1 else f"BINANCE{n}"
+    # A venue with multiple accounts has no default account, so no key is the venue name
+    return f"BINANCE{n}"
 
 
 def _okx_key(n: int) -> str:
-    return "OKX" if n == 1 else f"OKX{n}"
+    return f"OKX{n}"
 
 
 class TestTradingNodeMultiAccount:
@@ -134,26 +134,24 @@ class TestTradingNodeMultiAccount:
         # Assert
         exec_engine = node.kernel.exec_engine
         assert sorted(c.value for c in exec_engine.registered_clients) == [
-            "BINANCE",
+            "BINANCE1",
             "BINANCE2",
-            "OKX",
+            "OKX1",
             "OKX2",
         ]
-        assert exec_engine._routing_map[BINANCE].id == ClientId("BINANCE")
-        assert exec_engine._routing_map[OKX].id == ClientId("OKX")
-        assert exec_engine._secondary_clients == {
-            ClientId("BINANCE2"): BINANCE,
-            ClientId("OKX2"): OKX,
-        }
+        # No default account: multi-account venues have no venue routing
+        assert exec_engine._routing_map == {}
+        assert [c.id.value for c in exec_engine._venue_clients[BINANCE]] == ["BINANCE1", "BINANCE2"]
+        assert [c.id.value for c in exec_engine._venue_clients[OKX]] == ["OKX1", "OKX2"]
 
         clients = exec_engine._clients
-        assert clients[ClientId("BINANCE")].account_id == AccountId(
-            "BINANCE-USDT_FUTURES-master",
+        assert clients[ClientId("BINANCE1")].account_id == AccountId(
+            "BINANCE1-USDT_FUTURES-master",
         )
         assert clients[ClientId("BINANCE2")].account_id == AccountId(
             "BINANCE2-USDT_FUTURES-master",
         )
-        assert clients[ClientId("OKX")].account_id == AccountId("OKX-master")
+        assert clients[ClientId("OKX1")].account_id == AccountId("OKX1-master")
         assert clients[ClientId("OKX2")].account_id == AccountId("OKX2-master")
 
     def test_each_account_uses_its_own_credentials(self, event_loop_for_setup):
@@ -162,15 +160,15 @@ class TestTradingNodeMultiAccount:
 
         # Assert
         clients = node.kernel.exec_engine._clients
-        assert clients[ClientId("BINANCE")]._http_client.api_key == "BINANCE_KEY_1"
+        assert clients[ClientId("BINANCE1")]._http_client.api_key == "BINANCE_KEY_1"
         assert clients[ClientId("BINANCE2")]._http_client.api_key == "BINANCE_KEY_2"
-        assert clients[ClientId("OKX")]._http_client.api_key == "OKX_KEY_1"
+        assert clients[ClientId("OKX1")]._http_client.api_key == "OKX_KEY_1"
         assert clients[ClientId("OKX2")]._http_client.api_key == "OKX_KEY_2"
         assert (
-            clients[ClientId("BINANCE")]._http_client
+            clients[ClientId("BINANCE1")]._http_client
             is not clients[ClientId("BINANCE2")]._http_client
         )
-        assert clients[ClientId("OKX")]._http_client is not clients[ClientId("OKX2")]._http_client
+        assert clients[ClientId("OKX1")]._http_client is not clients[ClientId("OKX2")]._http_client
 
     def test_build_with_ten_accounts_on_single_venue(self, event_loop_for_setup):
         # Act
@@ -180,9 +178,9 @@ class TestTradingNodeMultiAccount:
         exec_engine = node.kernel.exec_engine
         clients = exec_engine._clients
         assert len(clients) == 10
-        assert exec_engine._routing_map[BINANCE].id == ClientId("BINANCE")
-        assert set(exec_engine._secondary_clients) == {
-            ClientId(f"BINANCE{n}") for n in range(2, 11)
+        assert BINANCE not in exec_engine._routing_map
+        assert {c.id for c in exec_engine._venue_clients[BINANCE]} == {
+            ClientId(f"BINANCE{n}") for n in range(1, 11)
         }
         account_ids = {client.account_id for client in clients.values()}
         assert len(account_ids) == 10
@@ -197,12 +195,12 @@ class TestTradingNodeMultiAccount:
         exec_engine = node.kernel.exec_engine
         clients = exec_engine._clients
         assert len(clients) == 20
-        assert exec_engine._routing_map[BINANCE].id == ClientId("BINANCE")
-        assert exec_engine._routing_map[OKX].id == ClientId("OKX")
-        assert len(exec_engine._secondary_clients) == 18
-        for client_id, venue in exec_engine._secondary_clients.items():
-            assert clients[client_id].venue == venue
-            assert client_id.value.startswith(venue.value)
+        assert exec_engine._routing_map == {}
+        for venue, venue_clients in exec_engine._venue_clients.items():
+            assert len(venue_clients) == 10
+            for client in venue_clients:
+                assert client.venue == venue
+                assert client.id.value.startswith(venue.value)
         for client in clients.values():
             assert client.account_id.get_issuer() == client.id.value
         assert len({client.account_id for client in clients.values()}) == 20
@@ -227,13 +225,13 @@ class TestTradingNodeMultiAccount:
                             "instrument_provider": {"load_all": False},
                         },
                     }
-                    for key in ("BINANCE", "BINANCE2", "BINANCE3")
+                    for key in ("BINANCE1", "BINANCE2", "BINANCE3")
                 },
             },
         )
 
         node = TradingNode(config=TradingNodeConfig.parse(raw), loop=event_loop_for_setup)
-        for key in ("BINANCE", "BINANCE2", "BINANCE3"):
+        for key in ("BINANCE1", "BINANCE2", "BINANCE3"):
             node.add_exec_client_factory(key, BinanceLiveExecClientFactory)
 
         # Act
@@ -241,7 +239,7 @@ class TestTradingNodeMultiAccount:
 
         # Assert
         clients = node.kernel.exec_engine._clients
-        assert sorted(c.value for c in clients) == ["BINANCE", "BINANCE2", "BINANCE3"]
+        assert sorted(c.value for c in clients) == ["BINANCE1", "BINANCE2", "BINANCE3"]
         assert clients[ClientId("BINANCE3")]._http_client.api_key == "BINANCE3_KEY"
 
     def test_hyphenated_keys_collapse_to_same_client_id_and_fail(self, event_loop_for_setup):
@@ -261,3 +259,49 @@ class TestTradingNodeMultiAccount:
         # Act, Assert
         with pytest.raises(KeyError, match="BINANCE"):
             node.build()
+
+    def test_client_named_after_venue_with_other_accounts_fails_to_build(
+        self,
+        event_loop_for_setup,
+    ):
+        # Arrange - "BINANCE" would be a default account among multiple accounts
+        node = TradingNode(
+            config=TradingNodeConfig(
+                logging=LoggingConfig(bypass_logging=True),
+                exec_clients={
+                    "BINANCE": _binance_exec_config(1),
+                    "BINANCE2": _binance_exec_config(2),
+                },
+            ),
+            loop=event_loop_for_setup,
+        )
+        node.add_exec_client_factory("BINANCE", BinanceLiveExecClientFactory)
+        node.add_exec_client_factory("BINANCE2", BinanceLiveExecClientFactory)
+
+        # Act, Assert
+        with pytest.raises(ValueError, match="no default account"):
+            node.build()
+
+    def test_single_account_named_after_venue_builds_with_venue_routing(
+        self,
+        event_loop_for_setup,
+    ):
+        # Arrange
+        node = TradingNode(
+            config=TradingNodeConfig(
+                logging=LoggingConfig(bypass_logging=True),
+                exec_clients={"BINANCE": _binance_exec_config(1)},
+            ),
+            loop=event_loop_for_setup,
+        )
+        node.add_exec_client_factory("BINANCE", BinanceLiveExecClientFactory)
+
+        # Act
+        node.build()
+
+        # Assert
+        exec_engine = node.kernel.exec_engine
+        assert exec_engine._routing_map[BINANCE].id == ClientId("BINANCE")
+        assert exec_engine._clients[ClientId("BINANCE")].account_id == AccountId(
+            "BINANCE-USDT_FUTURES-master",
+        )

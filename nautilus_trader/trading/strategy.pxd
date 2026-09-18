@@ -191,5 +191,7 @@ cdef class Strategy(Actor):
     cdef OrderDenied _generate_order_denied(self, Order order, str reason)
     cdef OrderPendingUpdate _generate_order_pending_update(self, Order order)
     cdef OrderPendingCancel _generate_order_pending_cancel(self, Order order)
+    cdef AccountId _account_id_for_client(self, ClientId client_id)
+    cdef bint _is_order_for_client(self, Order order, ClientId client_id, AccountId account_id)
     cdef void _deny_order(self, Order order, str reason)
     cdef void _deny_order_list(self, OrderList order_list, str reason)

@@ -3673,21 +3673,23 @@ async def test_query_position_status_reports_handles_exceptions(live_exec_engine
 async def test_query_position_status_reports_scopes_failure_to_account_for_multi_client_venue(
     event_loop,
     live_exec_engine,
-    exec_client,
     cache,
 ):
-    # Arrange
+    # Arrange - a venue with multiple accounts (no client is named after the venue)
     clock = LiveClock()
-    secondary_client = MockLiveExecutionClient(
-        loop=event_loop,
-        client_id=ClientId("SIM2"),
-        venue=Venue("SIM"),
-        account_type=AccountType.CASH,
-        base_currency=USD,
-        instrument_provider=InstrumentProvider(),
-        msgbus=MessageBus(trader_id=TestIdStubs.trader_id(), clock=clock),
-        cache=cache,
-        clock=clock,
+    exec_client, secondary_client = (
+        MockLiveExecutionClient(
+            loop=event_loop,
+            client_id=ClientId(name),
+            venue=Venue("SIM"),
+            account_type=AccountType.CASH,
+            base_currency=USD,
+            instrument_provider=InstrumentProvider(),
+            msgbus=MessageBus(trader_id=TestIdStubs.trader_id(), clock=clock),
+            cache=cache,
+            clock=clock,
+        )
+        for name in ("SIM1", "SIM2")
     )
     live_exec_engine.register_client(exec_client)
     live_exec_engine.register_client(secondary_client)

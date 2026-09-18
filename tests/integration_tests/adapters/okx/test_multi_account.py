@@ -52,7 +52,7 @@ def okx_clients(
     instrument,
 ):
     """
-    Build a primary ("OKX") and a secondary ("OKXB") execution client sharing one cache,
+    Build two execution clients ("OKX1" and "OKX2", one per account) sharing one cache,
     each with its own HTTP client and WebSocket mocks.
     """
     ws_calls: list[dict] = []
@@ -69,7 +69,7 @@ def okx_clients(
     cache.add_instrument(instrument)
 
     clients = {}
-    for name, key in (("OKX", "KEY_A"), ("OKXB", "KEY_B")):
+    for name, key in (("OKX1", "KEY_A"), ("OKX2", "KEY_B")):
         http_client = MagicMock()
         http_client.api_key = key
         config = OKXExecClientConfig(
@@ -136,11 +136,11 @@ def test_client_and_account_ids_derive_from_name(okx_clients):
     clients, _ = okx_clients
 
     # Assert
-    assert clients["OKX"].id == ClientId("OKX")
-    assert clients["OKXB"].id == ClientId("OKXB")
-    assert clients["OKX"].account_id == AccountId("OKX-master")
-    assert clients["OKXB"].account_id == AccountId("OKXB-master")
-    assert clients["OKX"].venue == clients["OKXB"].venue == OKX_VENUE
+    assert clients["OKX1"].id == ClientId("OKX1")
+    assert clients["OKX2"].id == ClientId("OKX2")
+    assert clients["OKX1"].account_id == AccountId("OKX1-master")
+    assert clients["OKX2"].account_id == AccountId("OKX2-master")
+    assert clients["OKX1"].venue == clients["OKX2"].venue == OKX_VENUE
 
 
 def test_websockets_created_with_each_accounts_credentials_and_account_id(okx_clients):
@@ -156,11 +156,11 @@ def test_websockets_created_with_each_accounts_credentials_and_account_id(okx_cl
     for call in by_key["KEY_A"]:
         assert call["api_secret"] == "KEY_A_SECRET"
         assert call["api_passphrase"] == "KEY_A_PASSPHRASE"
-        assert call["account_id"] == nautilus_pyo3.AccountId("OKX-master")
+        assert call["account_id"] == nautilus_pyo3.AccountId("OKX1-master")
     for call in by_key["KEY_B"]:
         assert call["api_secret"] == "KEY_B_SECRET"
         assert call["api_passphrase"] == "KEY_B_PASSPHRASE"
-        assert call["account_id"] == nautilus_pyo3.AccountId("OKXB-master")
+        assert call["account_id"] == nautilus_pyo3.AccountId("OKX2-master")
 
 
 def test_both_clients_register_with_engine_for_same_venue(okx_clients, cache, live_clock):
@@ -170,29 +170,27 @@ def test_both_clients_register_with_engine_for_same_venue(okx_clients, cache, li
     engine = ExecutionEngine(msgbus=engine_msgbus, cache=cache, clock=live_clock)
 
     # Act
-    engine.register_client(clients["OKX"])
-    engine.register_client(clients["OKXB"])
+    engine.register_client(clients["OKX1"])
+    engine.register_client(clients["OKX2"])
 
-    # Assert
-    assert engine._routing_map[OKX_VENUE] == clients["OKX"]
-    assert engine._secondary_clients == {ClientId("OKXB"): OKX_VENUE}
+    # Assert - no default account for the venue
+    assert OKX_VENUE not in engine._routing_map
+    assert engine._venue_clients[OKX_VENUE] == [clients["OKX1"], clients["OKX2"]]
 
 
 @pytest.mark.asyncio
 async def test_each_client_cancels_only_its_own_orders(okx_clients, cache, instrument):
     # Arrange
     clients, _ = okx_clients
-    primary_orders = [_open_order(cache, instrument, AccountId("OKX-master"), n) for n in range(2)]
-    secondary_orders = [
-        _open_order(cache, instrument, AccountId("OKXB-master"), n) for n in range(3)
-    ]
+    first_orders = [_open_order(cache, instrument, AccountId("OKX1-master"), n) for n in range(2)]
+    second_orders = [_open_order(cache, instrument, AccountId("OKX2-master"), n) for n in range(3)]
 
     # Act
     for client in clients.values():
         await client._cancel_all_orders(_cancel_all(instrument))
 
     # Assert
-    for name, orders in (("OKX", primary_orders), ("OKXB", secondary_orders)):
+    for name, orders in (("OKX1", first_orders), ("OKX2", second_orders)):
         ws = clients[name]._ws_client
         ws.batch_cancel_orders.assert_called_once()
         assert len(ws.batch_cancel_orders.call_args[0][0]) == len(orders), name
@@ -206,17 +204,17 @@ async def test_mass_cancel_failure_rejects_only_own_account_orders(
 ):
     # Arrange
     clients, _ = okx_clients
-    secondary = clients["OKXB"]
-    _open_order(cache, instrument, AccountId("OKX-master"), 0)
-    secondary_order = _open_order(cache, instrument, AccountId("OKXB-master"), 0)
-    secondary._ws_client.mass_cancel_orders = AsyncMock(side_effect=RuntimeError("boom"))
+    second = clients["OKX2"]
+    _open_order(cache, instrument, AccountId("OKX1-master"), 0)
+    second_order = _open_order(cache, instrument, AccountId("OKX2-master"), 0)
+    second._ws_client.mass_cancel_orders = AsyncMock(side_effect=RuntimeError("boom"))
     rejected = []
-    secondary.generate_order_cancel_rejected = lambda **kwargs: rejected.append(
+    second.generate_order_cancel_rejected = lambda **kwargs: rejected.append(
         kwargs["client_order_id"],
     )
 
     # Act
-    await secondary._cancel_all_orders_mass_cancel(_cancel_all(instrument))
+    await second._cancel_all_orders_mass_cancel(_cancel_all(instrument))
 
     # Assert
-    assert rejected == [secondary_order.client_order_id]
+    assert rejected == [second_order.client_order_id]

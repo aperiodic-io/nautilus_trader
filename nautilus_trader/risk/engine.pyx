@@ -509,6 +509,7 @@ cdef class RiskEngine(Component):
         # VALIDATE COMMAND
         ########################################################################
         cdef Order order = self._cache.order(command.client_order_id)
+        cdef AccountId account_id = None
 
         if order is None:
             self._log.error(
@@ -570,13 +571,14 @@ cdef class RiskEngine(Component):
             return  # Denied
         elif self.trading_state == TradingState.REDUCING:
             if command.quantity and command.quantity > order.quantity:
-                if order.is_buy_c() and self._portfolio.is_net_long(instrument.id):
+                account_id = self._reducing_account_id(order, None)
+                if order.is_buy_c() and self._portfolio.is_net_long(instrument.id, account_id):
                     self._reject_modify_order(
                         order=order,
                         reason="TradingState is REDUCING and update will increase exposure",
                     )
                     return  # Denied
-                elif order.is_sell_c() and self._portfolio.is_net_short(instrument.id):
+                elif order.is_sell_c() and self._portfolio.is_net_short(instrument.id, account_id):
                     self._reject_modify_order(
                         order=order,
                         reason="TradingState is REDUCING and update will increase exposure",
@@ -1163,9 +1165,25 @@ cdef class RiskEngine(Component):
 
 # -- EGRESS ---------------------------------------------------------------------------------------
 
+    cdef AccountId _reducing_account_id(self, Order order, TradingCommand command):
+        # The account whose net position a REDUCING check applies to: the order's
+        # account, else the account the command resolves to, else the venue's
+        # primary account (None aggregates across accounts)
+        if order.account_id is not None:
+            return order.account_id
+
+        cdef AccountId account_id = None
+        if command is not None:
+            account_id = self._resolve_account_id(command)
+            if account_id is not None:
+                return account_id
+
+        return self._cache.account_id(order.instrument_id.venue)
+
     cpdef void _execution_gateway(self, Instrument instrument, TradingCommand command):
         # Check TradingState
         cdef Order order
+        cdef AccountId account_id = None
 
         if self.trading_state == TradingState.HALTED:
             if isinstance(command, SubmitOrder):
@@ -1183,14 +1201,15 @@ cdef class RiskEngine(Component):
         elif self.trading_state == TradingState.REDUCING:
             if isinstance(command, SubmitOrder):
                 order = command.order
+                account_id = self._reducing_account_id(order, command)
 
-                if order.is_buy_c() and self._portfolio.is_net_long(instrument.id):
+                if order.is_buy_c() and self._portfolio.is_net_long(instrument.id, account_id):
                     self._deny_command(
                         command=command,
                         reason=f"BUY when TradingState.REDUCING and LONG {instrument.id}",
                     )
                     return  # Denied
-                elif order.is_sell_c() and self._portfolio.is_net_short(instrument.id):
+                elif order.is_sell_c() and self._portfolio.is_net_short(instrument.id, account_id):
                     self._deny_command(
                         command=command,
                         reason=f"SELL when TradingState.REDUCING and SHORT {instrument.id}",
@@ -1198,13 +1217,14 @@ cdef class RiskEngine(Component):
                     return  # Denied
             elif isinstance(command, SubmitOrderList):
                 for order in command.order_list.orders:
-                    if order.is_buy_c() and self._portfolio.is_net_long(order.instrument_id):
+                    account_id = self._reducing_account_id(order, command)
+                    if order.is_buy_c() and self._portfolio.is_net_long(order.instrument_id, account_id):
                         self._deny_order_list(
                             order_list=command.order_list,
                             reason=f"OrderList contains BUY when TradingState.REDUCING and LONG {order.instrument_id}",
                         )
                         return  # Denied
-                    elif order.is_sell_c() and self._portfolio.is_net_short(order.instrument_id):
+                    elif order.is_sell_c() and self._portfolio.is_net_short(order.instrument_id, account_id):
                         self._deny_order_list(
                             order_list=command.order_list,
                             reason=f"OrderList contains SELL when TradingState.REDUCING and SHORT {order.instrument_id}",

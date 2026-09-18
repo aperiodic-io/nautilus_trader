@@ -1832,7 +1832,7 @@ async def test_recent_fills_cache_prevents_duplicate_reconciliation(
     await asyncio.sleep(0.05)
 
     # Verify fill is in recent cache
-    assert TradeId("T-CACHE-1") in exec_engine._recent_fills_cache
+    assert (account_id, TradeId("T-CACHE-1")) in exec_engine._recent_fills_cache
 
     # Position is 100k
     positions = cache.positions_open(instrument_id=AUDUSD_SIM.id)

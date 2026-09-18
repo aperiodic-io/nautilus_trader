@@ -56,8 +56,8 @@ from nautilus_trader.trading.strategy import Strategy
 ETHUSDT_PERP_BINANCE = TestInstrumentProvider.ethusdt_perp_binance()
 BTCUSDT_BINANCE = TestInstrumentProvider.btcusdt_binance()
 
-PRIMARY_ACCOUNT_ID = AccountId("BINANCE-USDT_FUTURES-master")
-SECONDARY_ACCOUNT_ID = AccountId("BINANCE2-USDT_FUTURES-master")
+FIRST_ACCOUNT_ID = AccountId("BINANCE1-USDT_FUTURES-master")
+SECOND_ACCOUNT_ID = AccountId("BINANCE2-USDT_FUTURES-master")
 
 # Base64-encoded 32 zero bytes for an Ed25519 private key (test only)
 DUMMY_API_SECRET = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -76,10 +76,10 @@ class TestBinanceMultiAccountClients:
         self.portfolio = Portfolio(msgbus=self.msgbus, cache=self.cache, clock=self.clock)
         self.exec_engine = ExecutionEngine(msgbus=self.msgbus, cache=self.cache, clock=self.clock)
 
-        self.primary = self._make_client("BINANCE", "PRIMARY_KEY")
-        self.secondary = self._make_client("BINANCE2", "SECONDARY_KEY")
-        self.exec_engine.register_client(self.primary)
-        self.exec_engine.register_client(self.secondary)
+        self.first = self._make_client("BINANCE1", "FIRST_KEY")
+        self.second = self._make_client("BINANCE2", "SECOND_KEY")
+        self.exec_engine.register_client(self.first)
+        self.exec_engine.register_client(self.second)
 
         self.strategy = Strategy()
         self.strategy.register(
@@ -144,26 +144,26 @@ class TestBinanceMultiAccountClients:
 
     def test_client_and_account_ids_derive_from_name(self):
         # Assert
-        assert self.primary.id == ClientId("BINANCE")
-        assert self.secondary.id == ClientId("BINANCE2")
-        assert self.primary.account_id == PRIMARY_ACCOUNT_ID
-        assert self.secondary.account_id == SECONDARY_ACCOUNT_ID
-        assert self.primary.venue == self.secondary.venue
+        assert self.first.id == ClientId("BINANCE1")
+        assert self.second.id == ClientId("BINANCE2")
+        assert self.first.account_id == FIRST_ACCOUNT_ID
+        assert self.second.account_id == SECOND_ACCOUNT_ID
+        assert self.first.venue == self.second.venue
 
     def test_clients_use_their_own_http_credentials(self):
         # Assert
-        assert self.primary._http_client.api_key == "PRIMARY_KEY"
-        assert self.secondary._http_client.api_key == "SECONDARY_KEY"
+        assert self.first._http_client.api_key == "FIRST_KEY"
+        assert self.second._http_client.api_key == "SECOND_KEY"
 
     def test_both_clients_register_with_engine_for_same_venue(self):
-        # Assert
-        assert self.exec_engine._routing_map[self.primary.venue] == self.primary
-        assert self.exec_engine._secondary_clients == {ClientId("BINANCE2"): self.primary.venue}
+        # Assert - no default account for the venue
+        assert self.first.venue not in self.exec_engine._routing_map
+        assert self.exec_engine._venue_clients[self.first.venue] == [self.first, self.second]
 
     def test_active_symbols_scoped_to_client_account(self):
         # Arrange
         self.cache.add_instrument(BTCUSDT_BINANCE)
-        self._open_order(PRIMARY_ACCOUNT_ID)
+        self._open_order(FIRST_ACCOUNT_ID)
         btc_order = self.strategy.order_factory.limit(
             instrument_id=BTCUSDT_BINANCE.id,
             order_side=OrderSide.BUY,
@@ -171,62 +171,62 @@ class TestBinanceMultiAccountClients:
             price=Price.from_str("10000.00"),
         )
         self.cache.add_order(btc_order, None)
-        btc_order.apply(TestEventStubs.order_submitted(btc_order, account_id=SECONDARY_ACCOUNT_ID))
+        btc_order.apply(TestEventStubs.order_submitted(btc_order, account_id=SECOND_ACCOUNT_ID))
         self.cache.update_order(btc_order)
-        btc_order.apply(TestEventStubs.order_accepted(btc_order, account_id=SECONDARY_ACCOUNT_ID))
+        btc_order.apply(TestEventStubs.order_accepted(btc_order, account_id=SECOND_ACCOUNT_ID))
         self.cache.update_order(btc_order)
 
         # Act, Assert
-        assert self.primary._get_cache_active_symbols() == {"ETHUSDT-PERP"}
-        assert self.secondary._get_cache_active_symbols() == {"BTCUSDT"}
+        assert self.first._get_cache_active_symbols() == {"ETHUSDT-PERP"}
+        assert self.second._get_cache_active_symbols() == {"BTCUSDT"}
 
     @pytest.mark.asyncio
     async def test_each_client_cancels_only_its_own_orders(self, mocker):
         # Arrange
-        primary_orders = [self._open_order(PRIMARY_ACCOUNT_ID) for _ in range(2)]
-        secondary_orders = [self._open_order(SECONDARY_ACCOUNT_ID) for _ in range(3)]
-        primary_batch = mocker.patch.object(self.primary, "_cancel_orders_batch", AsyncMock())
-        secondary_batch = mocker.patch.object(self.secondary, "_cancel_orders_batch", AsyncMock())
-        mocker.patch.object(self.primary, "_cancel_orders_for_strategy", AsyncMock())
-        mocker.patch.object(self.secondary, "_cancel_orders_for_strategy", AsyncMock())
+        first_orders = [self._open_order(FIRST_ACCOUNT_ID) for _ in range(2)]
+        second_orders = [self._open_order(SECOND_ACCOUNT_ID) for _ in range(3)]
+        first_batch = mocker.patch.object(self.first, "_cancel_orders_batch", AsyncMock())
+        second_batch = mocker.patch.object(self.second, "_cancel_orders_batch", AsyncMock())
+        mocker.patch.object(self.first, "_cancel_orders_for_strategy", AsyncMock())
+        mocker.patch.object(self.second, "_cancel_orders_for_strategy", AsyncMock())
 
         # Act - the engine sends a cancel all without client ID to both clients
-        await self.primary._cancel_all_orders(self._cancel_all_command())
-        await self.secondary._cancel_all_orders(self._cancel_all_command())
+        await self.first._cancel_all_orders(self._cancel_all_command())
+        await self.second._cancel_all_orders(self._cancel_all_command())
 
         # Assert
-        assert sorted(o.client_order_id.value for o in primary_batch.call_args[0][1]) == sorted(
-            o.client_order_id.value for o in primary_orders
+        assert sorted(o.client_order_id.value for o in first_batch.call_args[0][1]) == sorted(
+            o.client_order_id.value for o in first_orders
         )
-        assert sorted(o.client_order_id.value for o in secondary_batch.call_args[0][1]) == sorted(
-            o.client_order_id.value for o in secondary_orders
+        assert sorted(o.client_order_id.value for o in second_batch.call_args[0][1]) == sorted(
+            o.client_order_id.value for o in second_orders
         )
 
     @pytest.mark.asyncio
     async def test_cancel_all_with_no_orders_on_account_sends_nothing(self, mocker):
-        # Arrange - only the secondary has orders
-        self._open_order(SECONDARY_ACCOUNT_ID)
-        primary_batch = mocker.patch.object(self.primary, "_cancel_orders_batch", AsyncMock())
-        primary_individual = mocker.patch.object(
-            self.primary,
+        # Arrange - only the second account has orders
+        self._open_order(SECOND_ACCOUNT_ID)
+        first_batch = mocker.patch.object(self.first, "_cancel_orders_batch", AsyncMock())
+        first_individual = mocker.patch.object(
+            self.first,
             "_cancel_orders_for_strategy",
             AsyncMock(),
         )
 
         # Act
-        await self.primary._cancel_all_orders(self._cancel_all_command())
+        await self.first._cancel_all_orders(self._cancel_all_command())
 
-        # Assert - nothing to cancel on the primary's own account
-        primary_batch.assert_not_called()
-        primary_individual.assert_not_called()
+        # Assert - nothing to cancel on the first client's own account
+        first_batch.assert_not_called()
+        first_individual.assert_not_called()
 
 
 class TestBinanceMultiAccountPositionIds:
     @pytest.mark.parametrize(
         ("account_id", "expected"),
         [
-            (PRIMARY_ACCOUNT_ID, "BTCUSDT-PERP.BINANCE-LONG"),
-            (SECONDARY_ACCOUNT_ID, "BTCUSDT-PERP.BINANCE-LONG-BINANCE2"),
+            (FIRST_ACCOUNT_ID, "BTCUSDT-PERP.BINANCE-LONG-BINANCE1"),
+            (SECOND_ACCOUNT_ID, "BTCUSDT-PERP.BINANCE-LONG-BINANCE2"),
         ],
     )
     def test_liquidation_fill_report_position_id_per_account(self, mocker, account_id, expected):
@@ -260,8 +260,8 @@ class TestBinanceMultiAccountPositionIds:
     @pytest.mark.parametrize(
         ("account_id", "expected"),
         [
-            (PRIMARY_ACCOUNT_ID, "ETHUSDT-PERP.BINANCE-SHORT"),
-            (SECONDARY_ACCOUNT_ID, "ETHUSDT-PERP.BINANCE-SHORT-BINANCE2"),
+            (FIRST_ACCOUNT_ID, "ETHUSDT-PERP.BINANCE-SHORT-BINANCE1"),
+            (SECOND_ACCOUNT_ID, "ETHUSDT-PERP.BINANCE-SHORT-BINANCE2"),
         ],
     )
     def test_position_status_report_position_id_per_account(self, account_id, expected):
@@ -295,7 +295,7 @@ class TestBinanceMultiAccountPositionIds:
     def test_hedge_mode_positions_for_two_accounts_are_distinct(self):
         # Arrange
         reports = []
-        for account_id in (PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID):
+        for account_id in (FIRST_ACCOUNT_ID, SECOND_ACCOUNT_ID):
             position = BinanceFuturesPositionRisk(
                 symbol="ETHUSDT",
                 positionSide=BinanceFuturesPositionSide.LONG,

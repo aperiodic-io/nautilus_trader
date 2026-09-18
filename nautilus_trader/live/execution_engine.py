@@ -153,7 +153,9 @@ class LiveExecutionEngine(ExecutionEngine):
         self._order_local_activity_ns: dict[ClientOrderId, int] = {}
         self._position_local_activity_ns: dict[InstrumentAccountKey, int] = {}
         self._position_recon_retries: Counter[InstrumentAccountKey] = Counter()
-        self._recent_fills_cache: dict[TradeId, int] = {}  # TradeId -> timestamp_ns (TTL cache)
+        # (AccountId, TradeId) -> timestamp_ns (TTL cache); trade IDs are only unique per account
+        self._recent_fills_cache: dict[tuple[AccountId, TradeId], int] = {}
+        self._failed_order_query_clients: set[ClientId] = set()
         self._inferred_fill_ts: dict[ClientOrderId, int] = {}
         self._fill_application_audit: dict[ClientOrderId, list[tuple[TradeId, str, int]]] = {}
         self._startup_reconciliation_event: asyncio.Event = asyncio.Event()
@@ -953,7 +955,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
             missing_fills, had_fill_query_errors = await self._query_and_find_missing_fills(
                 instrument_id,
-                clients,
+                self._clients_for_account_query(account_id, clients),
             )
 
             await self._reconcile_missing_fills(missing_fills, instrument_id)
@@ -1151,7 +1153,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
             missing_fills, had_fill_query_errors = await self._query_and_find_missing_fills(
                 instrument_id,
-                clients,
+                self._clients_for_account_query(account_id, clients),
             )
             await self._reconcile_missing_fills(missing_fills, instrument_id)
 
@@ -1225,22 +1227,37 @@ class LiveExecutionEngine(ExecutionEngine):
             fills = cast("list[FillReport]", fills_or_exception)
             venue_fills.extend(fills)
 
-        cached_fill_trade_ids: set[TradeId] = set()
+        # Trade IDs are only unique per account (both sides of a trade between two
+        # accounts share the venue trade ID), so fills are keyed by account
+        cached_fill_keys: set[tuple[AccountId, TradeId]] = set()
 
         for order in self._cache.orders(instrument_id=instrument_id):
             for event in order.events:
                 if isinstance(event, OrderFilled):
-                    cached_fill_trade_ids.add(event.trade_id)
+                    cached_fill_keys.add((event.account_id, event.trade_id))
 
         # Find missing fills (not in cache and not in recent fills cache)
         missing_fills = [
             fill
             for fill in venue_fills
-            if fill.trade_id not in cached_fill_trade_ids
-            and fill.trade_id not in self._recent_fills_cache
+            if (fill.account_id, fill.trade_id) not in cached_fill_keys
+            and (fill.account_id, fill.trade_id) not in self._recent_fills_cache
         ]
 
         return missing_fills, had_fill_query_errors
+
+    def _clients_for_account_query(
+        self,
+        account_id: AccountId | None,
+        clients: Iterable[ExecutionClient],
+    ) -> list[ExecutionClient]:
+        # Query only the account's client (when registered), so another account's
+        # query errors or fills do not affect this account's reconciliation
+        account_client = self._client_for_account(account_id)
+        if account_client is not None:
+            return [account_client]
+
+        return list(clients)
 
     async def _reconcile_missing_fills(
         self,
@@ -1278,14 +1295,14 @@ class LiveExecutionEngine(ExecutionEngine):
         # Remove expired fills from cache (default TTL: 60 seconds)
         ts_now = self._clock.timestamp_ns()
         ttl_ns = secs_to_nanos(ttl_secs)
-        expired_trade_ids = [
-            trade_id
-            for trade_id, ts_cached in self._recent_fills_cache.items()
+        expired_keys = [
+            key
+            for key, ts_cached in self._recent_fills_cache.items()
             if ts_now - ts_cached > ttl_ns
         ]
 
-        for trade_id in expired_trade_ids:
-            self._recent_fills_cache.pop(trade_id, None)
+        for key in expired_keys:
+            self._recent_fills_cache.pop(key, None)
 
     async def _check_orders_consistency(self) -> None:
         try:
@@ -1337,11 +1354,27 @@ class LiveExecutionEngine(ExecutionEngine):
 
                 return  # Can't reliably resolve missing orders in open_only mode
 
+            if self._failed_order_query_clients:
+                # Orders of clients whose query failed are unknown, not missing
+                all_order_ids = {
+                    client_order_id
+                    for client_order_id in all_order_ids
+                    if not self._is_order_of_failed_query_client(client_order_id)
+                }
+
             await self._handle_missing_orders_at_venue(all_order_ids, venue_reported_ids)
 
             self._validate_open_orders_consistency()
         except Exception as e:
             self._log.exception("Error in check_order_consistency", e)
+
+    def _is_order_of_failed_query_client(self, client_order_id: ClientOrderId) -> bool:
+        order = self._cache.order(client_order_id)
+        if order is None:
+            return False
+
+        client = self._client_for_order(order)
+        return client is not None and client.id in self._failed_order_query_clients
 
     def _validate_open_orders_consistency(self) -> None:
         for order in self._cache.orders_open():
@@ -1440,14 +1473,18 @@ class LiveExecutionEngine(ExecutionEngine):
         )
 
         client_id = self._cache.client_id(order.client_order_id)
-        if client_id is None:
+        client = self._clients.get(client_id) if client_id is not None else None
+        if client is None:
+            # Resolve the client from the order's account (e.g. reconciled orders
+            # have no cached client ID)
+            client = self._client_for_account(order.account_id)
+
+        if client is None:
             self._log.warning(
-                f"No client_id found for {order.client_order_id!r}, skipping targeted query",
+                f"No client found for {order.client_order_id!r}, skipping targeted query",
             )
             # Skip targeted query but proceed with resolution
         else:
-            client = self._clients.get(client_id)
-
             try:
                 query_ts = self._clock.timestamp_ns()
                 command = GenerateOrderStatusReport(
@@ -1559,7 +1596,7 @@ class LiveExecutionEngine(ExecutionEngine):
             minutes=self.open_check_lookback_mins,
         )
 
-        clients = self._clients.values()
+        clients = list(self._clients.values())
 
         tasks = [
             c.generate_order_status_reports(
@@ -1579,10 +1616,15 @@ class LiveExecutionEngine(ExecutionEngine):
         order_reports_all = await asyncio.gather(*tasks, return_exceptions=True)
         all_order_reports: list[OrderStatusReport] = []
 
-        for reports_or_exception in order_reports_all:
+        # Track clients whose query failed, so their orders are not treated as
+        # missing at the venue (a venue may have multiple clients, one per account)
+        self._failed_order_query_clients = set()
+
+        for client, reports_or_exception in zip(clients, order_reports_all, strict=True):
             if isinstance(reports_or_exception, BaseException):
+                self._failed_order_query_clients.add(client.id)
                 self._log.error(
-                    f"Failed to generate order status reports: {reports_or_exception}",
+                    f"Failed to generate order status reports for {client.id}: {reports_or_exception}",
                 )
                 continue
 
@@ -3511,7 +3553,7 @@ class LiveExecutionEngine(ExecutionEngine):
             client = self._clients.get(ClientId(report.account_id.get_issuer()))
 
         if client is None:
-            client = self._routing_map.get(instrument.id.venue, self._default_client)
+            client = self._venue_client(instrument.id.venue)
 
         filled = create_inferred_order_filled_event(
             order=order,
@@ -3742,7 +3784,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
         if isinstance(event, OrderFilled):
             ts_now = self._clock.timestamp_ns()
-            self._recent_fills_cache[event.trade_id] = ts_now
+            self._recent_fills_cache[(event.account_id, event.trade_id)] = ts_now
 
             # Stamp receipt time: a venue ts_event ahead of this clock would make
             # the grace delta negative and suppress the position check.

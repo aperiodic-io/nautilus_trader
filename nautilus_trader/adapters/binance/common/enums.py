@@ -663,11 +663,17 @@ class BinanceEnumParser:
         self,
         position_id: PositionId,
     ) -> BinanceFuturesPositionSide:
-        if position_id.value.endswith("LONG"):  # Position Long
+        value = position_id.value
+        if not value.endswith(("LONG", "SHORT", "BOTH")):
+            # Positions of additional accounts are suffixed with the account issuer,
+            # e.g. 'ETHUSDT-PERP.BINANCE-LONG-BINANCE2'
+            value = value.rpartition("-")[0]
+
+        if value.endswith("LONG"):  # Position Long
             return BinanceFuturesPositionSide.LONG
-        elif position_id.value.endswith("SHORT"):  # Position Short
+        elif value.endswith("SHORT"):  # Position Short
             return BinanceFuturesPositionSide.SHORT
-        elif position_id.value.endswith("BOTH"):
+        elif value.endswith("BOTH"):
             return BinanceFuturesPositionSide.BOTH
         else:
             raise RuntimeError(  # pragma: no cover (design-time error)

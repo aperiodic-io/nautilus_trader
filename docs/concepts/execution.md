@@ -254,34 +254,46 @@ each cycle once. A void confined to the current cycle leaves the archive intact.
 
 ## Multiple accounts per venue
 
-A live node can register several execution clients for the same venue, one per account. The
-first client registered for a venue keeps the venue routing; each further client is registered
-as an additional client for that venue. Client IDs must not contain a hyphen, because the account
-ID issuer (the part before the first `-`) must equal the client ID.
+A live node can register several execution clients for the same venue, one per account. A venue
+with multiple accounts has **no default account**: nothing is routed, risk-checked, or reconciled
+against an account the command does not resolve to.
 
-The `ExecutionEngine` routes commands in this order:
+- A venue with a single client is unchanged: commands for its instruments route to that client.
+- A venue with multiple clients has no venue routing. No client may be named after the venue
+  (name each client for its account, for example `BINANCE1`, `BINANCE2`), a venue routing
+  override (`RoutingConfig.venues`) is rejected, and the default client is never used for it.
+- Client IDs of venue clients must not contain a hyphen, because the account ID issuer (the part
+  before the first `-`) must equal the client ID.
+
+The `ExecutionEngine` resolves the client (account) for a command in this order:
 
 1. An explicit `client_id` on the command.
-2. The client the order was routed to (for modify, cancel, and query commands).
-3. The client of the account that the order, or the position an order targets, belongs to.
-   `Strategy.close_position` therefore routes to the account holding the position.
-4. The client with the venue routing.
-5. The default client.
+2. The client the order was submitted to (for modify, cancel, and query commands).
+3. The client of the order's account.
+4. The client of the account holding the position the order targets, so
+   `Strategy.close_position` routes to the account holding the position.
+5. For a single-account venue only, the venue's client, then the default client.
 
-Orders for an additional account must be submitted with its `client_id`. A `CancelAllOrders`
-command without a `client_id` goes to every client for the venue, and each cancels the orders of
-its own account. A `BatchCancelOrders` command without a `client_id` is split by the client each
-order was routed to.
+On a venue with multiple accounts, an order that does not resolve to an account is denied with an
+`AMBIGUOUS_ACCOUNT` reason. A `CancelAllOrders` command without a `client_id` goes only to the
+clients (accounts) on which the strategy has working orders for the instrument, and a
+`BatchCancelOrders` command without a `client_id` is split by the account of each order. With an
+explicit `client_id`, `Strategy.cancel_all_orders` and `Strategy.close_all_positions` only act on
+the orders and positions of that client's account.
 
-Positions are kept separate per account. Under `NETTING`, position IDs for an additional client
-are suffixed with its client ID, `{instrument_id}-{strategy_id}-{client_id}`, so one strategy can
-hold a position on the same instrument in each account. The engine does not apply a fill to a
-position that belongs to a different account.
+Positions are kept separate per account. On a venue with multiple accounts, every `NETTING`
+position ID carries the client ID, `{instrument_id}-{strategy_id}-{client_id}`, so one strategy can
+hold a position on the same instrument in each account. The ID depends only on the client ID, not
+on registration order. The engine never applies a fill to a position of a different account.
 
-The `RiskEngine` checks orders against the account that the `client_id` (or the targeted
-position) resolves to. Portfolio and cache account lookups by venue return the primary account
-only; pass an `account_id` to query an additional account, for example
+The `RiskEngine` checks orders against the account the `client_id` (or targeted position) resolves
+to, including the `REDUCING` trading state check. Portfolio and cache account lookups by venue
+return no account for a venue with multiple accounts; pass an `account_id`, for example
 `portfolio.account(account_id=AccountId("BINANCE2-USDT_FUTURES-master"))`.
+
+Live reconciliation is scoped per account: a failed status query for one account does not cause
+the orders or positions of another account to be treated as missing, and fills are matched by
+account and trade ID, as both sides of a trade between two accounts share the venue trade ID.
 
 ## Risk engine
 

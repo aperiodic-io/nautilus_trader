@@ -51,7 +51,7 @@ cdef class ExecutionEngine(Component):
     cdef readonly set[ClientId] _external_clients
     cdef readonly dict[ClientId, ExecutionClient] _clients
     cdef readonly dict[Venue, ExecutionClient] _routing_map
-    cdef readonly dict[ClientId, Venue] _secondary_clients
+    cdef readonly dict[Venue, list] _venue_clients
     cdef readonly dict[StrategyId, OmsType] _oms_overrides
     cdef readonly dict[InstrumentId, StrategyId] _external_order_claims
     cdef readonly PositionIdGenerator _pos_id_generator
@@ -130,9 +130,10 @@ cdef class ExecutionEngine(Component):
     cdef str _get_cancel_events_topic(self, InstrumentId instrument_id)
     cdef str _get_commands_topic(self, ClientId client_id)
     cpdef ExecutionClient _find_client_for_command(self, Command command)
-    cdef ExecutionClient _client_for_account(self, AccountId account_id)
-    cdef ExecutionClient _client_for_order(self, Order order)
-    cdef list _clients_for_venue(self, Venue venue)
+    cpdef bint _is_multi_account_venue(self, Venue venue)
+    cpdef ExecutionClient _venue_client(self, Venue venue)
+    cpdef ExecutionClient _client_for_account(self, AccountId account_id)
+    cpdef ExecutionClient _client_for_order(self, Order order)
     cdef str _netting_position_id_str(self, InstrumentId instrument_id, StrategyId strategy_id, ClientId client_id)
 
     cpdef void _set_position_id_counts(self)

@@ -88,6 +88,7 @@ cdef class RiskEngine(Component):
     cpdef bint _check_order_price(self, Instrument instrument, Order order)
     cpdef bint _check_order_quantity(self, Instrument instrument, Order order)
     cdef AccountId _resolve_account_id(self, TradingCommand command)
+    cdef AccountId _reducing_account_id(self, Order order, TradingCommand command)
     cpdef bint _check_orders_risk(self, Instrument instrument, list orders, AccountId default_account_id=*)
     cpdef bint _check_orders_risk_for_account(self, Instrument instrument, list orders, AccountId account_id)
     cpdef str _check_price(self, Instrument instrument, Price price)

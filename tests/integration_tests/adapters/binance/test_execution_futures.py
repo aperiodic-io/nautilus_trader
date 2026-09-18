@@ -52,6 +52,7 @@ from nautilus_trader.model.enums import TrailingOffsetType
 from nautilus_trader.model.enums import TriggerType
 from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientOrderId
+from nautilus_trader.model.identifiers import PositionId
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
@@ -169,6 +170,9 @@ class TestBinanceFuturesExecutionClient:
             (True, TestIdStubs.position_id_long(), "LONG"),
             (True, TestIdStubs.position_id_short(), "SHORT"),
             # (True, TestIdStubs.position_id_both(), "BOTH"),
+            # Hedge mode, venue position IDs of an account suffixed with its issuer
+            (True, PositionId("ETHUSDT-PERP.BINANCE-LONG-BINANCE2"), "LONG"),
+            (True, PositionId("ETHUSDT-PERP.BINANCE-SHORT-BINANCE2"), "SHORT"),
         ],
     )
     async def test_submit_market_order(self, mocker, _is_dual_side_position, position_id, expected):
@@ -225,6 +229,9 @@ class TestBinanceFuturesExecutionClient:
             (True, TestIdStubs.position_id_long(), "LONG"),
             (True, TestIdStubs.position_id_short(), "SHORT"),
             # (True, TestIdStubs.position_id_both(), "BOTH"),
+            # Hedge mode, venue position IDs of an account suffixed with its issuer
+            (True, PositionId("ETHUSDT-PERP.BINANCE-LONG-BINANCE2"), "LONG"),
+            (True, PositionId("ETHUSDT-PERP.BINANCE-SHORT-BINANCE2"), "SHORT"),
         ],
     )
     async def test_submit_limit_order(self, mocker, _is_dual_side_position, position_id, expected):
@@ -536,6 +543,9 @@ class TestBinanceFuturesExecutionClient:
             (True, TestIdStubs.position_id_long(), "LONG"),
             (True, TestIdStubs.position_id_short(), "SHORT"),
             # (True, TestIdStubs.position_id_both(), "BOTH"),
+            # Hedge mode, venue position IDs of an account suffixed with its issuer
+            (True, PositionId("ETHUSDT-PERP.BINANCE-LONG-BINANCE2"), "LONG"),
+            (True, PositionId("ETHUSDT-PERP.BINANCE-SHORT-BINANCE2"), "SHORT"),
         ],
     )
     async def test_submit_limit_post_only_order(
@@ -602,6 +612,9 @@ class TestBinanceFuturesExecutionClient:
             (True, TestIdStubs.position_id_long(), "LONG"),
             (True, TestIdStubs.position_id_short(), "SHORT"),
             # (True, TestIdStubs.position_id_both(), "BOTH"),
+            # Hedge mode, venue position IDs of an account suffixed with its issuer
+            (True, PositionId("ETHUSDT-PERP.BINANCE-LONG-BINANCE2"), "LONG"),
+            (True, PositionId("ETHUSDT-PERP.BINANCE-SHORT-BINANCE2"), "SHORT"),
         ],
     )
     async def test_submit_stop_market_order(
@@ -751,6 +764,9 @@ class TestBinanceFuturesExecutionClient:
             (True, TestIdStubs.position_id_long(), "LONG"),
             (True, TestIdStubs.position_id_short(), "SHORT"),
             # (True, TestIdStubs.position_id_both(), "BOTH"),
+            # Hedge mode, venue position IDs of an account suffixed with its issuer
+            (True, PositionId("ETHUSDT-PERP.BINANCE-LONG-BINANCE2"), "LONG"),
+            (True, PositionId("ETHUSDT-PERP.BINANCE-SHORT-BINANCE2"), "SHORT"),
         ],
     )
     async def test_submit_stop_limit_order(
@@ -822,6 +838,9 @@ class TestBinanceFuturesExecutionClient:
             (True, TestIdStubs.position_id_long(), "LONG"),
             (True, TestIdStubs.position_id_short(), "SHORT"),
             # (True, TestIdStubs.position_id_both(), "BOTH"),
+            # Hedge mode, venue position IDs of an account suffixed with its issuer
+            (True, PositionId("ETHUSDT-PERP.BINANCE-LONG-BINANCE2"), "LONG"),
+            (True, PositionId("ETHUSDT-PERP.BINANCE-SHORT-BINANCE2"), "SHORT"),
         ],
     )
     async def test_submit_market_if_touched_order(
@@ -889,6 +908,9 @@ class TestBinanceFuturesExecutionClient:
             (True, TestIdStubs.position_id_long(), "LONG"),
             (True, TestIdStubs.position_id_short(), "SHORT"),
             # (True, TestIdStubs.position_id_both(), "BOTH"),
+            # Hedge mode, venue position IDs of an account suffixed with its issuer
+            (True, PositionId("ETHUSDT-PERP.BINANCE-LONG-BINANCE2"), "LONG"),
+            (True, PositionId("ETHUSDT-PERP.BINANCE-SHORT-BINANCE2"), "SHORT"),
         ],
     )
     async def test_submit_limit_if_touched_order(
@@ -959,6 +981,9 @@ class TestBinanceFuturesExecutionClient:
             (True, TestIdStubs.position_id_long(), "LONG"),
             (True, TestIdStubs.position_id_short(), "SHORT"),
             # (True, TestIdStubs.position_id_both(), "BOTH"),
+            # Hedge mode, venue position IDs of an account suffixed with its issuer
+            (True, PositionId("ETHUSDT-PERP.BINANCE-LONG-BINANCE2"), "LONG"),
+            (True, PositionId("ETHUSDT-PERP.BINANCE-SHORT-BINANCE2"), "SHORT"),
         ],
     )
     async def test_trailing_stop_market_order(
