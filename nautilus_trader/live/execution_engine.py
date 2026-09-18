@@ -3607,7 +3607,7 @@ class LiveExecutionEngine(ExecutionEngine):
 
         # Check if any strategy has claimed external orders for this instrument
         # This allows strategies to resume managing existing orders on restart
-        strategy_id = self.get_external_order_claim(report.instrument_id)
+        strategy_id = self.get_external_order_claim(report.instrument_id, report.account_id)
 
         if strategy_id is None:
             # All unclaimed reconciliation uses EXTERNAL strategy ID

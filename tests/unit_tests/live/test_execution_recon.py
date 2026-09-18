@@ -2484,7 +2484,7 @@ class TestReconciliationEdgeCases:
         strategy_id = StrategyId("S-CLAIM")
         self.cache.add_instrument(instrument)
         live_exec_engine.generate_missing_orders = True
-        live_exec_engine._external_order_claims[instrument.id] = strategy_id
+        live_exec_engine._external_order_claims_any[instrument.id] = (strategy_id, False)
 
         report = PositionStatusReport(
             account_id=TestIdStubs.account_id(),

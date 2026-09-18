@@ -1070,32 +1070,27 @@ cdef class Portfolio(PortfolioFacade):
             if not pos.is_closed_c():
                 involved_accounts.add(pos.account_id)
 
-        # Prevent silent currency mixing across accounts with different base currencies
-        cdef:
-            set[Currency] base_currencies = set()
-            AccountId involved_account_id
-            Account involved_account
-            list[str] currency_strs
-            Currency currency
-            str currencies_str
-        if target_currency is None and account_id is None and len(involved_accounts) > 1:
+        # A venue with multiple accounts has no default account: never silently net one
+        # account's exposure against another's (long vs short would cancel, hiding real
+        # risk), regardless of whether a target_currency is provided.
+        cdef str accounts_str
+        cdef AccountId involved_account_id
+        cdef list[str] involved_account_strs
+        if account_id is None and len(involved_accounts) > 1:
+            involved_account_strs = []
             for involved_account_id in involved_accounts:
-                involved_account = self._cache.account(involved_account_id)
-                if involved_account is not None and involved_account.base_currency is not None:
-                    base_currencies.add(involved_account.base_currency)
-
-            if len(base_currencies) > 1:
-                currency_strs = []
-                for currency in base_currencies:
-                    currency_strs.append(str(currency))
-
-                currencies_str = ", ".join(currency_strs)
-                self._log.error(
-                    f"Cannot calculate net exposures: multiple accounts with different base currencies "
-                    f"({currencies_str}). "
-                    f"Provide an explicit target_currency to aggregate across accounts."
-                )
-                return None
+                if involved_account_id is not None:
+                    involved_account_strs.append(involved_account_id.value)
+            involved_account_strs.sort()
+            accounts_str = ", ".join(involved_account_strs)
+            self._log.error(
+                f"Cannot calculate net exposures for {venue}: multiple accounts found "
+                f"({accounts_str}) and no account_id was provided; there is no default "
+                f"account for a venue with multiple accounts. Provide an explicit "
+                f"account_id, or use `Portfolio.account_ids(venue)` for a per-account "
+                f"breakdown.",
+            )
+            return None
 
         cdef:
             dict[Currency, double] net_exposures = {}
@@ -1160,6 +1155,40 @@ cdef class Portfolio(PortfolioFacade):
         dict[Currency, Money]
 
         """
+        cdef list positions_open
+        cdef set[AccountId] involved_accounts
+        cdef Position pos
+        cdef list[str] account_strs
+        cdef AccountId acc_id
+        cdef str accounts_str
+        if account_id is None and venue is not None:
+            positions_open = self._cache.positions_open(
+                venue=venue,
+                instrument_id=None,
+                strategy_id=None,
+                side=PositionSide.NO_POSITION_SIDE,
+                account_id=None,
+            )
+            involved_accounts = set()
+            for pos in positions_open:
+                if not pos.is_closed_c() and pos.account_id is not None:
+                    involved_accounts.add(pos.account_id)
+
+            if len(involved_accounts) > 1:
+                account_strs = []
+                for acc_id in involved_accounts:
+                    account_strs.append(acc_id.value)
+                account_strs.sort()
+                accounts_str = ", ".join(account_strs)
+                self._log.error(
+                    f"Cannot calculate mark values for {venue}: multiple accounts found "
+                    f"({accounts_str}) and no account_id was provided; there is no default "
+                    f"account for a venue with multiple accounts. Provide an explicit "
+                    f"account_id, or use `Portfolio.account_ids(venue)` for a per-account "
+                    f"breakdown.",
+                )
+                return None
+
         cdef dict values = {}
         cdef set unpriced = set()
         cdef Venue tracker_venue = self._accumulate_mark_values(venue, account_id, values, unpriced)
@@ -1197,6 +1226,9 @@ cdef class Portfolio(PortfolioFacade):
         """
         cdef Account account = self._cache.account_for_venue(venue, account_id)
         if account is None:
+            if account_id is None and venue is not None:
+                self._log_ambiguous_venue_accounts(venue, "equity")
+
             return {}
 
         cdef dict equity = {}
@@ -1268,6 +1300,102 @@ cdef class Portfolio(PortfolioFacade):
             return []
 
         return list(tracked)
+
+    cpdef set account_ids(self, Venue venue):
+        """
+        Return every account ID known to trade on the given venue.
+
+        A venue with a single account has one entry (matching `Cache.account_id`). A
+        venue with multiple accounts (no default account) has one entry per account:
+        every account ever seen holding an order or position for an instrument of the
+        venue, discovered directly from the cache. This is the explicit way to
+        enumerate a multi-account venue's accounts, for example to compute a
+        per-account breakdown of a query that would otherwise be ambiguous (see
+        `account`, `equity`, `net_exposures`, `mark_values`).
+
+        Parameters
+        ----------
+        venue : Venue
+            The venue to query.
+
+        Returns
+        -------
+        set[AccountId]
+
+        """
+        Condition.not_none(venue, "venue")
+
+        cdef set[AccountId] account_ids = set()
+
+        cdef AccountId direct = self._cache.account_id(venue)
+        if direct is not None:
+            account_ids.add(direct)
+
+        cdef Order order
+        for order in self._cache.orders(venue=venue):
+            if order.account_id is not None:
+                account_ids.add(order.account_id)
+
+        cdef Position position
+        for position in self._cache.positions(venue=venue):
+            if position.account_id is not None:
+                account_ids.add(position.account_id)
+
+        return account_ids
+
+    cpdef list accounts(self, Venue venue):
+        """
+        Return every account known to trade on the given venue.
+
+        See `account_ids` for how the accounts of a venue are discovered.
+
+        Parameters
+        ----------
+        venue : Venue
+            The venue to query.
+
+        Returns
+        -------
+        list[Account]
+
+        """
+        Condition.not_none(venue, "venue")
+
+        cdef list accounts = []
+        cdef AccountId account_id
+        cdef Account account
+        for account_id in self.account_ids(venue):
+            account = self._cache.account(account_id)
+            if account is not None:
+                accounts.append(account)
+
+        return accounts
+
+    cpdef dict net_position_by_account(self, InstrumentId instrument_id):
+        """
+        Return the net position for the given instrument, broken down by account.
+
+        Unlike `net_position` (which sums across every account by default), this never
+        combines two accounts' positions: each account's own net position is returned
+        under its own key.
+
+        Parameters
+        ----------
+        instrument_id : InstrumentId
+            The instrument for the query.
+
+        Returns
+        -------
+        dict[AccountId, Decimal]
+
+        """
+        Condition.not_none(instrument_id, "instrument_id")
+
+        cdef dict account_positions = self._net_positions.get(instrument_id)
+        if account_positions is None:
+            return {}
+
+        return dict(account_positions)
 
     cpdef Money realized_pnl(self, InstrumentId instrument_id, AccountId account_id=None, Currency target_currency=None):
         """
@@ -1408,6 +1536,13 @@ cdef class Portfolio(PortfolioFacade):
         """
         Return the net exposure for the given instrument (if found).
 
+        If `account_id` is None and more than one account holds a position in this
+        instrument, returns ``None`` and logs an error: netting one account's exposure
+        against another's would cancel long against short and hide real risk, so there is
+        no default account to aggregate across. Provide `account_id` explicitly, or use
+        `Portfolio.net_position_by_account` / `Portfolio.account_ids` for a per-account
+        breakdown.
+
         Parameters
         ----------
         instrument_id : InstrumentId
@@ -1433,37 +1568,36 @@ cdef class Portfolio(PortfolioFacade):
             account_id=account_id,
         )
 
-        # Validate consistent base currency across accounts when aggregating
-        # (only needed if no target_currency is provided, as we can convert to target_currency)
+        # A venue with multiple accounts has no default account: never silently net one
+        # account's exposure against another's, regardless of target_currency.
         cdef:
             set[AccountId] account_ids
-            Currency first_base_currency = None
-            Account account
             AccountId acc_id
             Position position
+            str accounts_str
+            list[str] account_strs
 
-        if account_id is None and target_currency is None and positions:
+        if account_id is None and positions:
             account_ids = set()
 
-            # Collect unique account IDs from positions
             for position in positions:
                 if position.account_id is not None:
                     account_ids.add(position.account_id)
 
-            # Validate accounts from cache
-            for acc_id in account_ids:
-                account = self._cache.account(acc_id)
-                if account is not None:
-                    if first_base_currency is None:
-                        first_base_currency = account.base_currency
-                    elif account.base_currency is not None and account.base_currency != first_base_currency:
-                        self._log.error(
-                            f"Cannot calculate net exposure: "
-                            f"accounts have different base currencies "
-                            f"({first_base_currency} vs {account.base_currency}); "
-                            f"multi-account aggregation requires consistent base currencies",
-                        )
-                        return None
+            if len(account_ids) > 1:
+                account_strs = []
+                for acc_id in account_ids:
+                    account_strs.append(acc_id.value)
+                account_strs.sort()
+                accounts_str = ", ".join(account_strs)
+                self._log.error(
+                    f"Cannot calculate net exposure for {instrument_id}: multiple accounts "
+                    f"found ({accounts_str}) and no account_id was provided; there is no "
+                    f"default account for a venue with multiple accounts. Provide an "
+                    f"explicit account_id, or use `Portfolio.net_position_by_account` for "
+                    f"a per-account breakdown.",
+                )
+                return None
 
         cdef Instrument instrument_obj = self._cache.instrument(instrument_id)
         if instrument_obj is None:
@@ -1916,12 +2050,37 @@ cdef class Portfolio(PortfolioFacade):
 
         cdef Account account = self._cache.account_for_venue(venue, account_id)
         if account is None:
+            if account_id is None and venue is not None and self._log_ambiguous_venue_accounts(venue, caller_name):
+                return None
+
             self._log.error(
                 f"Cannot get {caller_name}: "
                 f"no account registered for {venue=} and {account_id=}",
             )
 
         return account
+
+    cdef bint _log_ambiguous_venue_accounts(self, Venue venue, str caller_name):
+        # If `venue` has more than one known account, log a clear "ambiguous" error
+        # (distinct from "no account at all") and return True. There is no default
+        # account for a venue with multiple accounts.
+        cdef set accounts = self.account_ids(venue)
+        if len(accounts) <= 1:
+            return False
+
+        cdef list[str] account_strs = []
+        cdef AccountId acc_id
+        for acc_id in accounts:
+            account_strs.append(acc_id.value)
+        account_strs.sort()
+        cdef str accounts_str = ", ".join(account_strs)
+        self._log.error(
+            f"Cannot get {caller_name}: {venue} has multiple accounts ({accounts_str}) and "
+            "no account_id was provided; there is no default account for a venue with "
+            "multiple accounts. Provide an explicit account_id, or use "
+            "`Portfolio.account_ids(venue)`/`Portfolio.accounts(venue)` to enumerate them.",
+        )
+        return True
 
     cdef void _update_net_position(self, InstrumentId instrument_id, list positions_open):
         # Update net positions per account for the given instrument.

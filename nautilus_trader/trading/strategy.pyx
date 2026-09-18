@@ -27,8 +27,10 @@ attempts to operate without a managing `Trader` instance.
 
 import pandas as pd
 
+from nautilus_trader.trading.config import ExternalOrderClaim
 from nautilus_trader.trading.config import ImportableStrategyConfig
 from nautilus_trader.trading.config import StrategyConfig
+from nautilus_trader.trading.config import parse_external_order_claims
 
 from libc.stdint cimport uint64_t
 
@@ -192,18 +194,8 @@ cdef class Strategy(Actor):
     def _parse_external_order_claims(
         self,
         config_claims: list[str] | None,
-    ) -> list[InstrumentId]:
-        if config_claims is None:
-            return []
-
-        order_claims: list[InstrumentId] = []
-
-        for instrument_id in config_claims:
-            if isinstance(instrument_id, str):
-                instrument_id = InstrumentId.from_str(instrument_id)
-            order_claims.append(instrument_id)
-
-        return order_claims
+    ) -> list[ExternalOrderClaim]:
+        return parse_external_order_claims(config_claims)
 
     def to_importable_config(self) -> ImportableStrategyConfig:
         """

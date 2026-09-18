@@ -30,6 +30,7 @@ from nautilus_trader.backtest.data_client import BacktestMarketDataClient
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.component import TestClock
+from nautilus_trader.common.config import InvalidConfiguration
 from nautilus_trader.config import DataEngineConfig
 from nautilus_trader.config import ExecEngineConfig
 from nautilus_trader.config import RiskEngineConfig
@@ -2151,3 +2152,181 @@ class TestMultiAccountScale:
                 assert self._calls(client_id) == [], client_id
         assert self.cache.positions_open(account_id=self.accounts[target]) == []
         assert len(self.cache.positions_open()) == len(self.clients) - 1
+
+
+class TestMultiAccountExternalOrderClaims(_MultiAccountFixture):
+    """
+    A venue with multiple accounts has no default account for external order claims
+    either: a bare (unscoped) claim only auto-applies on a single-account venue. On a
+    multi-account venue it must be scoped (`INSTRUMENT@CLIENT_ID`) or made an explicit
+    wildcard (`INSTRUMENT@*`).
+    """
+
+    def _register_claim_strategy(self, *claims: str, order_id_tag: str = "001") -> Strategy:
+        strategy = Strategy(
+            StrategyConfig(order_id_tag=order_id_tag, external_order_claims=list(claims)),
+        )
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_external_order_claims(strategy)
+        return strategy
+
+    def test_bare_claim_on_multi_account_venue_is_not_applied(self) -> None:
+        # Arrange
+        strategy = self._register_claim_strategy(str(ETHUSDT_PERP_BINANCE.id))
+
+        # Act
+        result = self.exec_engine.get_external_order_claim(ETHUSDT_PERP_BINANCE.id)
+
+        # Assert - unscoped claim does not apply on a venue with multiple accounts
+        assert result is None
+        assert strategy.external_order_claims[0].client_id is None
+        assert ETHUSDT_PERP_BINANCE.id in self.exec_engine._external_order_claims_warned
+
+    def test_bare_claim_warning_is_logged_once(self) -> None:
+        # Arrange
+        self._register_claim_strategy(str(ETHUSDT_PERP_BINANCE.id))
+
+        # Act
+        self.exec_engine.get_external_order_claim(ETHUSDT_PERP_BINANCE.id)
+        self.exec_engine.get_external_order_claim(ETHUSDT_PERP_BINANCE.id)
+        self.exec_engine.get_external_order_claim(ETHUSDT_PERP_BINANCE.id)
+
+        # Assert
+        assert self.exec_engine._external_order_claims_warned == {ETHUSDT_PERP_BINANCE.id}
+
+    def test_scoped_claim_applies_only_to_that_account(self) -> None:
+        # Arrange
+        strategy = self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE2_CLIENT_ID}",
+        )
+
+        # Act, Assert
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE2_ACCOUNT_ID,
+            )
+            == strategy.id
+        )
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE1_ACCOUNT_ID,
+            )
+            is None
+        )
+        # No account given at all: also unclaimed (ambiguous on a multi-account venue)
+        assert self.exec_engine.get_external_order_claim(ETHUSDT_PERP_BINANCE.id) is None
+
+    def test_wildcard_claim_applies_to_every_account(self) -> None:
+        # Arrange
+        strategy = self._register_claim_strategy(f"{ETHUSDT_PERP_BINANCE.id}@*")
+
+        # Act, Assert
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE1_ACCOUNT_ID,
+            )
+            == strategy.id
+        )
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE2_ACCOUNT_ID,
+            )
+            == strategy.id
+        )
+        # No warning: this is an explicit opt-in, not an implicit default
+        assert self.exec_engine._external_order_claims_warned == set()
+
+    def test_two_scoped_claims_for_different_accounts_do_not_conflict(self) -> None:
+        # Arrange, Act
+        strategy1 = self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE1_CLIENT_ID}",
+            order_id_tag="001",
+        )
+        strategy2 = self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE2_CLIENT_ID}",
+            order_id_tag="002",
+        )
+
+        # Assert
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE1_ACCOUNT_ID,
+            )
+            == strategy1.id
+        )
+        assert (
+            self.exec_engine.get_external_order_claim(
+                ETHUSDT_PERP_BINANCE.id,
+                BINANCE2_ACCOUNT_ID,
+            )
+            == strategy2.id
+        )
+
+    def test_two_scoped_claims_for_same_account_conflict(self) -> None:
+        # Arrange
+        self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE1_CLIENT_ID}",
+            order_id_tag="001",
+        )
+
+        # Act, Assert
+        with pytest.raises(InvalidConfiguration):
+            self._register_claim_strategy(
+                f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE1_CLIENT_ID}",
+                order_id_tag="002",
+            )
+
+    def test_wildcard_then_scoped_claim_for_same_instrument_conflicts(self) -> None:
+        # Arrange
+        self._register_claim_strategy(f"{ETHUSDT_PERP_BINANCE.id}@*", order_id_tag="001")
+
+        # Act, Assert
+        with pytest.raises(InvalidConfiguration):
+            self._register_claim_strategy(
+                f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE1_CLIENT_ID}",
+                order_id_tag="002",
+            )
+
+    def test_scoped_then_wildcard_claim_for_same_instrument_conflicts(self) -> None:
+        # Arrange
+        self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE1_CLIENT_ID}",
+            order_id_tag="001",
+        )
+
+        # Act, Assert
+        with pytest.raises(InvalidConfiguration):
+            self._register_claim_strategy(f"{ETHUSDT_PERP_BINANCE.id}@*", order_id_tag="002")
+
+    def test_bare_then_bare_claim_for_same_instrument_conflicts(self) -> None:
+        # Arrange
+        self._register_claim_strategy(str(ETHUSDT_PERP_BINANCE.id), order_id_tag="001")
+
+        # Act, Assert
+        with pytest.raises(InvalidConfiguration):
+            self._register_claim_strategy(str(ETHUSDT_PERP_BINANCE.id), order_id_tag="002")
+
+    def test_claims_instruments_returns_union_of_all_forms(self) -> None:
+        # Arrange
+        self._register_claim_strategy(
+            f"{ETHUSDT_PERP_BINANCE.id}@{BINANCE1_CLIENT_ID}",
+            f"{ETHUSDT_SWAP_OKX.id}@*",
+            order_id_tag="001",
+        )
+
+        # Act
+        result = self.exec_engine.get_external_order_claims_instruments()
+
+        # Assert
+        assert result == {ETHUSDT_PERP_BINANCE.id, ETHUSDT_SWAP_OKX.id}

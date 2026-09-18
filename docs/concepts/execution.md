@@ -295,6 +295,30 @@ Live reconciliation is scoped per account: a failed status query for one account
 the orders or positions of another account to be treated as missing, and fills are matched by
 account and trade ID, as both sides of a trade between two accounts share the venue trade ID.
 
+### External order claims on a multi-account venue
+
+`StrategyConfig.external_order_claims` also has no default account on a multi-account venue. A
+bare claim (`"ETHUSDT-PERP.BINANCE"`) is only applied automatically when the venue has a single
+account; on a venue with multiple accounts it is not applied (a warning is logged once), because
+claiming every account's external orders for one strategy is rarely what is intended. Scope the
+claim explicitly instead:
+
+- `"ETHUSDT-PERP.BINANCE@BINANCE2"` claims that instrument for the `BINANCE2` account only.
+- `"ETHUSDT-PERP.BINANCE@*"` claims it for every account of the venue (an explicit opt-in).
+
+```python
+config = StrategyConfig(
+    external_order_claims=[
+        "ETHUSDT-PERP.BINANCE@BINANCE1",
+        "ETHUSDT-PERP.BINANCE@BINANCE2",
+    ],
+)
+```
+
+Two claims for the same instrument conflict unless both are account-scoped to different accounts;
+a wildcard or bare claim covers every account of that instrument, so it conflicts with any other
+claim already registered for it.
+
 ## Risk engine
 
 The `RiskEngine` is a component of every Nautilus system, including backtest, sandbox, and live

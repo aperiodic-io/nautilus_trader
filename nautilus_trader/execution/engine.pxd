@@ -53,7 +53,9 @@ cdef class ExecutionEngine(Component):
     cdef readonly dict[Venue, ExecutionClient] _routing_map
     cdef readonly dict[Venue, list] _venue_clients
     cdef readonly dict[StrategyId, OmsType] _oms_overrides
-    cdef readonly dict[InstrumentId, StrategyId] _external_order_claims
+    cdef readonly dict[tuple, StrategyId] _external_order_claims_scoped
+    cdef readonly dict[InstrumentId, tuple] _external_order_claims_any
+    cdef readonly set[InstrumentId] _external_order_claims_warned
     cdef readonly PositionIdGenerator _pos_id_generator
     cdef readonly str snapshot_positions_timer_name
     cdef list[PositionEvent] _pending_position_events
@@ -103,7 +105,7 @@ cdef class ExecutionEngine(Component):
     cpdef bint check_disconnected(self)
     cpdef bint check_residuals(self)
     cpdef set[ClientId] get_external_client_ids(self)
-    cpdef StrategyId get_external_order_claim(self, InstrumentId instrument_id)
+    cpdef StrategyId get_external_order_claim(self, InstrumentId instrument_id, AccountId account_id=*)
     cpdef set[InstrumentId] get_external_order_claims_instruments(self)
     cpdef set[ExecutionClient] get_clients_for_orders(self, list[Order] orders)
     cpdef void set_manage_own_order_books(self, bint value)

@@ -179,7 +179,17 @@ class TestPortfolioAccountAggregation:
         assert net_2 == Decimal("-0.4")
         assert total_net == Decimal("0.6")
 
-    def test_net_exposure_sums_across_multiple_accounts(self):
+    def test_net_exposure_with_no_account_id_refuses_to_aggregate_across_accounts(self):
+        # A venue with multiple accounts has no default account: `net_exposure` (and
+        # `net_exposures`/`mark_values`) no longer silently sum two accounts' exposure
+        # together, even when they hold the same side of the same instrument in the same
+        # currency. Summing would still be misleading in the general case (a long on one
+        # account and a short on another would net out and hide real risk), so the
+        # aggregate is only available per account, or explicitly via
+        # `Portfolio.net_position_by_account` / `Portfolio.account_ids`.
+        # This intentionally changes the behaviour added in #3194, which summed
+        # same-currency accounts by default.
+        #
         # Arrange - Open positions in both accounts
         # Account 1: Long 1.0 BTC @ 50,000
         order1 = self.order_factory.market(
@@ -221,16 +231,14 @@ class TestPortfolioAccountAggregation:
         self.portfolio.initialize_positions()
 
         # Act
-        # Aggregate net exposure with explicit price
         current_price = Price.from_str("50000.00")
 
         # Exposure = Quantity * Price * Multiplier (1.0 for BTCUSDT)
         # Account 1: 1.0 * 50000 = 50000 USDT
         # Account 2: 0.5 * 50000 = 25000 USDT
-        # Total: 75000 USDT
-        total_exposure = self.portfolio.net_exposure(BTCUSDT_BINANCE.id, price=current_price)
+        ambiguous_exposure = self.portfolio.net_exposure(BTCUSDT_BINANCE.id, price=current_price)
 
-        # Individual exposures
+        # Individual exposures (explicit account_id is unaffected)
         exposure_1 = self.portfolio.net_exposure(
             BTCUSDT_BINANCE.id,
             price=current_price,
@@ -241,11 +249,16 @@ class TestPortfolioAccountAggregation:
             price=current_price,
             account_id=self.account_id_2,
         )
+        by_account = self.portfolio.net_position_by_account(BTCUSDT_BINANCE.id)
 
         # Assert
+        assert ambiguous_exposure is None
         assert exposure_1 == Money(50000.00, USDT)
         assert exposure_2 == Money(25000.00, USDT)
-        assert total_exposure == Money(75000.00, USDT)
+        assert by_account == {
+            self.account_id_1: Decimal("1.0"),
+            self.account_id_2: Decimal("0.5"),
+        }
 
     def test_unrealized_pnl_with_explicit_price_sums_across_multiple_accounts(self):
         # Arrange - Open positions in both accounts

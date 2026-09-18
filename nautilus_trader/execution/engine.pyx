@@ -149,7 +149,12 @@ cdef class ExecutionEngine(Component):
         self._default_client: ExecutionClient | None = None
         self._external_clients: set[ClientId] = set((config.external_clients or []))
         self._oms_overrides: dict[StrategyId, OmsType] = {}
-        self._external_order_claims: dict[InstrumentId, StrategyId] = {}
+        # Scoped claims: (instrument_id, client_id) -> strategy_id
+        self._external_order_claims_scoped: dict[tuple, StrategyId] = {}
+        # Unscoped or wildcard claims: instrument_id -> (strategy_id, wildcard)
+        self._external_order_claims_any: dict[InstrumentId, tuple] = {}
+        # Instruments an unscoped claim was suppressed for (already logged a warning)
+        self._external_order_claims_warned: set[InstrumentId] = set()
 
         self._pos_id_generator: PositionIdGenerator = PositionIdGenerator(
             trader_id=msgbus.trader_id,
@@ -333,14 +338,25 @@ cdef class ExecutionEngine(Component):
         """
         return self._external_clients.copy()
 
-    cpdef StrategyId get_external_order_claim(self, InstrumentId instrument_id):
+    cpdef StrategyId get_external_order_claim(self, InstrumentId instrument_id, AccountId account_id=None):
         """
-        Get any external order claim for the given instrument ID.
+        Get any external order claim for the given instrument ID (and account).
+
+        Resolution order:
+
+         1. A claim scoped to `account_id` (`INSTRUMENT@CLIENT_ID`), if `account_id` is given.
+         2. An explicit wildcard claim (`INSTRUMENT@*`), which applies to every account of
+            the instrument's venue.
+         3. An unscoped (bare `INSTRUMENT`) claim, but only when the instrument's venue has
+            a single account. A venue with multiple accounts has no default account, so a
+            bare claim there is never applied; a warning is logged once per instrument.
 
         Parameters
         ----------
         instrument_id : InstrumentId
             The instrument ID for the claim.
+        account_id : AccountId, optional
+            The account to resolve the claim for.
 
         Returns
         -------
@@ -349,18 +365,52 @@ cdef class ExecutionEngine(Component):
         """
         Condition.not_none(instrument_id, "instrument_id")
 
-        return self._external_order_claims.get(instrument_id)
+        cdef ClientId client_id
+        cdef StrategyId scoped
+        if account_id is not None:
+            client_id = ClientId(account_id.get_issuer())
+            scoped = self._external_order_claims_scoped.get((instrument_id, client_id))
+            if scoped is not None:
+                return scoped
+
+        cdef tuple any_claim = self._external_order_claims_any.get(instrument_id)
+        if any_claim is None:
+            return None
+
+        cdef StrategyId strategy_id = any_claim[0]
+        cdef bint wildcard = any_claim[1]
+        if wildcard:
+            return strategy_id
+
+        # Unscoped (bare) claim: only applies when the venue has a single account
+        if self._is_multi_account_venue(instrument_id.venue):
+            if instrument_id not in self._external_order_claims_warned:
+                self._external_order_claims_warned.add(instrument_id)
+                self._log.warning(
+                    f"External order claim for {instrument_id} by {strategy_id} is unscoped, "
+                    f"but {instrument_id.venue} has multiple accounts (no default account); "
+                    f"the claim will not be applied. Use '{instrument_id}@<CLIENT_ID>' to claim "
+                    f"orders for one account, or '{instrument_id}@*' to claim orders for every "
+                    "account of the venue.",
+                )
+
+            return None
+
+        return strategy_id
 
     cpdef set[InstrumentId] get_external_order_claims_instruments(self):
         """
-        Get all instrument IDs registered for external order claims.
+        Get all instrument IDs registered for external order claims (in any form).
 
         Returns
         -------
         set[InstrumentId]
 
         """
-        return set(self._external_order_claims.keys())
+        cdef set[InstrumentId] instruments = {i for i, _ in self._external_order_claims_scoped}
+        instruments.update(self._external_order_claims_any.keys())
+
+        return instruments
 
     cpdef set[ExecutionClient] get_clients_for_orders(self, list[Order] orders):
         """
@@ -581,7 +631,15 @@ cdef class ExecutionEngine(Component):
 
     cpdef void register_external_order_claims(self, Strategy strategy):
         """
-        Register the given strategies external order claim instrument IDs (if any)
+        Register the given strategies external order claim instrument IDs (if any).
+
+        Each claim is either account-scoped (`INSTRUMENT@CLIENT_ID`), a wildcard covering
+        every account of the venue (`INSTRUMENT@*`), or unscoped (bare `INSTRUMENT`, which
+        only applies when the venue has a single account; see `get_external_order_claim`).
+        At most one claim may cover a given (instrument, account) pair: a wildcard or
+        unscoped claim covers every account of that instrument, so it conflicts with any
+        other claim already registered for that instrument. Two account-scoped claims for
+        the same instrument but different accounts do not conflict.
 
         Parameters
         ----------
@@ -591,27 +649,63 @@ cdef class ExecutionEngine(Component):
         Raises
         ------
         InvalidConfiguration
-            If a strategy is already registered to claim external orders for an instrument ID.
+            If a claim conflicts with a claim already registered for that instrument
+            (and, for account-scoped claims, that account).
 
         """
         Condition.not_none(strategy, "strategy")
 
-        cdef:
-            InstrumentId instrument_id
-            StrategyId existing
-        for instrument_id in strategy.external_order_claims:
-            existing = self._external_order_claims.get(instrument_id)
-            if existing:
-                raise InvalidConfiguration(
-                    f"External order claim for {instrument_id} already exists for {existing}",
-                )
+        cdef list claims = strategy.external_order_claims
+        cdef InstrumentId instrument_id
+        cdef ClientId client_id
+        cdef bint wildcard
+        cdef StrategyId existing
+        cdef tuple existing_any
+        cdef tuple key
 
-            # Register strategy to claim external orders for this instrument
-            self._external_order_claims[instrument_id] = strategy.id
+        for claim in claims:
+            instrument_id = claim.instrument_id
+            client_id = claim.client_id
+            wildcard = claim.wildcard
 
-        if strategy.external_order_claims:
+            if client_id is not None:
+                existing = self._external_order_claims_scoped.get((instrument_id, client_id))
+                if existing is not None:
+                    raise InvalidConfiguration(
+                        f"External order claim for {instrument_id} account {client_id} "
+                        f"already exists for {existing}",
+                    )
+
+                existing_any = self._external_order_claims_any.get(instrument_id)
+                if existing_any is not None:
+                    raise InvalidConfiguration(
+                        f"External order claim for {instrument_id} account {client_id} "
+                        f"conflicts with an existing claim for {instrument_id} already "
+                        f"registered for {existing_any[0]}",
+                    )
+
+                self._external_order_claims_scoped[(instrument_id, client_id)] = strategy.id
+            else:
+                existing_any = self._external_order_claims_any.get(instrument_id)
+                if existing_any is not None:
+                    raise InvalidConfiguration(
+                        f"External order claim for {instrument_id} already exists for "
+                        f"{existing_any[0]}",
+                    )
+
+                for key in self._external_order_claims_scoped:
+                    if key[0] == instrument_id:
+                        raise InvalidConfiguration(
+                            f"External order claim for {instrument_id} conflicts with an "
+                            f"existing account-scoped claim for {instrument_id} already "
+                            f"registered for {self._external_order_claims_scoped[key]}",
+                        )
+
+                self._external_order_claims_any[instrument_id] = (strategy.id, wildcard)
+
+        if claims:
             self._log.info(
-                f"Registered external order claims for {strategy}: {strategy.external_order_claims}",
+                f"Registered external order claims for {strategy}: {claims}",
             )
 
     cpdef void deregister_client(self, ExecutionClient client):

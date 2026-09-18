@@ -23,6 +23,7 @@ import pytest
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.providers import InstrumentProvider
+from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import CancelOrder
 from nautilus_trader.execution.reports import FillReport
@@ -58,6 +59,7 @@ from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
+from nautilus_trader.trading.strategy import Strategy
 
 
 SIM = Venue("SIM")
@@ -776,3 +778,120 @@ class TestLiveReconciliationMultiAccount:
             assert len(positions) == 1, client.id
             assert positions[0].quantity == Quantity.from_int(10_000)
             assert positions[0].id == PositionId(f"{AUDUSD_SIM.id}-EXTERNAL-{client.id}")
+
+
+class TestLiveReconciliationExternalOrderClaims:
+    """
+    A reconciled order's strategy claim is resolved from the report's account, so a
+    strategy scoped to one account does not claim another account's external orders.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self, request):
+        self.loop = request.getfixturevalue("event_loop")
+        self.clock = LiveClock()
+        self.trader_id = TestIdStubs.trader_id()
+        self.msgbus = MessageBus(trader_id=self.trader_id, clock=self.clock)
+        self.cache = TestComponentStubs.cache()
+        self.cache.add_instrument(AUDUSD_SIM)
+        self.portfolio = Portfolio(msgbus=self.msgbus, cache=self.cache, clock=self.clock)
+        self.exec_engine = LiveExecutionEngine(
+            loop=self.loop,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        for client_id in (FIRST_CLIENT_ID, SECOND_CLIENT_ID):
+            self.exec_engine.register_client(
+                MockLiveExecutionClient(
+                    loop=self.loop,
+                    client_id=client_id,
+                    venue=SIM,
+                    account_type=AccountType.MARGIN,
+                    base_currency=USD,
+                    instrument_provider=InstrumentProvider(),
+                    msgbus=self.msgbus,
+                    cache=self.cache,
+                    clock=self.clock,
+                ),
+            )
+
+    def _register_claim_strategy(self, *claims: str) -> Strategy:
+        strategy = Strategy(StrategyConfig(external_order_claims=list(claims)))
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+        )
+        self.exec_engine.register_external_order_claims(strategy)
+        return strategy
+
+    def _order_status_report(self, account_id: AccountId) -> OrderStatusReport:
+        return OrderStatusReport(
+            account_id=account_id,
+            instrument_id=AUDUSD_SIM.id,
+            client_order_id=ClientOrderId(f"O-{account_id}-1"),
+            venue_order_id=VenueOrderId("V-1"),
+            order_side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.GTC,
+            order_status=OrderStatus.ACCEPTED,
+            price=Price.from_str("1.00000"),
+            quantity=Quantity.from_int(10_000),
+            filled_qty=Quantity.from_int(0),
+            report_id=UUID4(),
+            ts_accepted=0,
+            ts_last=0,
+            ts_init=0,
+        )
+
+    def test_reconciled_order_on_scoped_account_is_claimed(self) -> None:
+        # Arrange
+        strategy = self._register_claim_strategy(f"{AUDUSD_SIM.id}@{SECOND_CLIENT_ID}")
+        report = self._order_status_report(SECOND_ACCOUNT_ID)
+
+        # Act
+        order = self.exec_engine._generate_order(report)
+
+        # Assert
+        assert order.strategy_id == strategy.id
+
+    def test_reconciled_order_on_unclaimed_account_is_external(self) -> None:
+        # Arrange
+        self._register_claim_strategy(f"{AUDUSD_SIM.id}@{SECOND_CLIENT_ID}")
+        report = self._order_status_report(FIRST_ACCOUNT_ID)
+
+        # Act
+        order = self.exec_engine._generate_order(report)
+
+        # Assert
+        assert order.strategy_id == StrategyId("EXTERNAL")
+
+    def test_reconciled_order_with_wildcard_claim_applies_to_both_accounts(self) -> None:
+        # Arrange
+        strategy = self._register_claim_strategy(f"{AUDUSD_SIM.id}@*")
+
+        # Act
+        first_order = self.exec_engine._generate_order(
+            self._order_status_report(FIRST_ACCOUNT_ID),
+        )
+        second_order = self.exec_engine._generate_order(
+            self._order_status_report(SECOND_ACCOUNT_ID),
+        )
+
+        # Assert
+        assert first_order.strategy_id == strategy.id
+        assert second_order.strategy_id == strategy.id
+
+    def test_reconciled_order_with_bare_claim_on_multi_account_venue_is_external(self) -> None:
+        # Arrange - SIM has two accounts, so the bare claim does not apply
+        self._register_claim_strategy(str(AUDUSD_SIM.id))
+        report = self._order_status_report(FIRST_ACCOUNT_ID)
+
+        # Act
+        order = self.exec_engine._generate_order(report)
+
+        # Assert
+        assert order.strategy_id == StrategyId("EXTERNAL")
