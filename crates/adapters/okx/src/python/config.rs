@@ -148,6 +148,7 @@ impl OKXExecutionClientConfig {
         auth_timeout_secs = None,
         transport_backend = None,
         spot_trade_quote_ccy = None,
+        max_reconciliation_history_pages = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -171,6 +172,7 @@ impl OKXExecutionClientConfig {
         auth_timeout_secs: Option<u64>,
         transport_backend: Option<TransportBackend>,
         spot_trade_quote_ccy: Option<String>,
+        max_reconciliation_history_pages: Option<u32>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -199,6 +201,7 @@ impl OKXExecutionClientConfig {
             auth_timeout_secs,
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
             spot_trade_quote_ccy,
+            max_reconciliation_history_pages,
         }
     }
 
@@ -278,10 +281,12 @@ mod tests {
             None,
             None,
             Some("USD".to_string()),
+            Some(0),
         );
 
         assert!(config.load_spreads);
         assert_eq!(config.auth_timeout_secs, None);
         assert_eq!(config.spot_trade_quote_ccy.as_deref(), Some("USD"));
+        assert_eq!(config.max_reconciliation_history_pages, Some(0));
     }
 }
