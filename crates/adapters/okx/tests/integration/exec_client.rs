@@ -1804,7 +1804,7 @@ fn test_dispatch_positions_channel_emits_position_report() {
             assert_eq!(report.quantity, Quantity::from("0.500"));
             assert_eq!(
                 report.venue_position_id,
-                Some(PositionId::new("12345-LONG"))
+                Some(PositionId::new(format!("{instrument_id}-LONG")))
             );
         }
         other => panic!("Expected position report, was {other:?}"),
@@ -3017,12 +3017,21 @@ async fn create_query_order_test_client() -> (
 }
 
 fn create_exec_test_router() -> Router {
-    Router::new().route(
-        "/api/v5/account/balance",
-        get(|_headers: HeaderMap| async {
-            axum::Json(load_test_data("http_get_account_balance.json")).into_response()
-        }),
-    )
+    Router::new()
+        .route(
+            "/api/v5/account/balance",
+            get(|_headers: HeaderMap| async {
+                axum::Json(load_test_data("http_get_account_balance.json")).into_response()
+            }),
+        )
+        .route(
+            "/api/v5/account/config",
+            get(|_headers: HeaderMap| async {
+                let mut response = load_test_data("http_get_account_configuration.json");
+                response["data"][0]["posMode"] = serde_json::json!("net_mode");
+                axum::Json(response).into_response()
+            }),
+        )
 }
 
 #[derive(Clone, Default)]
@@ -4069,14 +4078,15 @@ async fn test_generate_order_status_reports_honors_open_only(
         pending.ts_init,
         Some(pending.report_id),
     )
-    .with_price(Price::from("103500"));
+    .with_price(Price::from("103500"))
+    .with_venue_position_id(PositionId::from("BTC-USDT-SWAP.OKX-LONG"));
     expected_pending.avg_px = Some(dec!(0));
     assert_eq!(pending, &expected_pending);
 
     if !open_only {
         let historical = &reports[1];
 
-        let mut expected_historical = OrderStatusReport::new(
+        let expected_historical = OrderStatusReport::new(
             AccountId::from("OKX-001"),
             InstrumentId::from("BTC-USDT-SWAP.OKX"),
             None,
@@ -4092,6 +4102,8 @@ async fn test_generate_order_status_reports_honors_open_only(
             historical.ts_init,
             Some(historical.report_id),
         );
+        let mut expected_historical =
+            expected_historical.with_venue_position_id(PositionId::from("BTC-USDT-SWAP.OKX-LONG"));
         expected_historical.avg_px = Some(dec!(103698.9));
         assert_eq!(historical, &expected_historical);
     }

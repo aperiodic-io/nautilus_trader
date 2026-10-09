@@ -15,7 +15,13 @@
 
 //! Live execution client implementation for the OKX adapter.
 
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
@@ -57,7 +63,8 @@ use nautilus_model::{
     },
     events::OrderDeniedReason,
     identifiers::{
-        AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Venue, VenueOrderId,
+        AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, Venue,
+        VenueOrderId,
     },
     instruments::InstrumentAny,
     orders::Order,
@@ -74,11 +81,14 @@ use crate::{
             OKX_WS_HEARTBEAT_SECS, okx_reduce_only_wire_value, resolve_instrument_families,
             validate_okx_client_order_id,
         },
-        enums::{OKXInstrumentType, OKXMarginMode, OKXTradeMode, is_advance_algo_order},
+        enums::{
+            OKXInstrumentType, OKXMarginMode, OKXPositionMode, OKXPositionSide, OKXTradeMode,
+            is_advance_algo_order,
+        },
         failure::{classify_okx_http_failure, classify_okx_venue_code, classify_okx_ws_failure},
         parse::{
             is_okx_spread_symbol, is_order_status_report_more_advanced, nanos_to_datetime,
-            okx_instrument_type_from_symbol,
+            okx_hedge_position_side, okx_instrument_type_from_symbol, okx_venue_position_id,
         },
         task::{spawn_task, terminate_tasks},
     },
@@ -111,6 +121,7 @@ pub struct OKXExecutionClient {
     ws_private: OKXWebSocketClient,
     ws_business: OKXWebSocketClient,
     trade_mode: OKXTradeMode,
+    is_hedge_mode: AtomicBool,
     ws_dispatch_state: Arc<WsDispatchState>,
     session_tasks: TaskGroup,
     pending_tasks: TaskGroup,
@@ -222,6 +233,7 @@ impl OKXExecutionClient {
             ws_private,
             ws_business,
             trade_mode,
+            is_hedge_mode: AtomicBool::new(false),
             ws_dispatch_state,
             session_tasks: TaskGroup::new(),
             pending_tasks: TaskGroup::new(),
@@ -270,6 +282,22 @@ impl OKXExecutionClient {
             instrument_id,
             self.config.margin_mode,
             self.config.use_spot_margin,
+        )
+    }
+
+    /// Returns the `posSide` for an order on a long/short mode account, otherwise `None`.
+    fn hedge_position_side(
+        &self,
+        order: &impl Order,
+        params: Option<&Params>,
+    ) -> Option<PositionSide> {
+        let is_closing =
+            order.is_reduce_only() || get_param_as_string(params, "close_fraction").is_some();
+        okx_hedge_position_side(
+            self.is_hedge_mode.load(Ordering::Acquire),
+            okx_instrument_type_from_symbol(order.instrument_id().symbol.as_str()),
+            order.order_side(),
+            is_closing,
         )
     }
 
@@ -417,7 +445,11 @@ impl OKXExecutionClient {
         }
     }
 
-    fn submit_regular_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+    fn submit_regular_order(
+        &self,
+        cmd: &SubmitOrder,
+        position_side: Option<PositionSide>,
+    ) -> anyhow::Result<()> {
         let order = {
             let cache = self.core.cache();
             cache.try_order_owned(&cmd.client_order_id)?
@@ -471,7 +503,7 @@ impl OKXExecutionClient {
                     Some(is_post_only),
                     Some(is_reduce_only),
                     Some(is_quote_quantity),
-                    None,
+                    position_side,
                     None,
                     px_usd,
                     px_vol,
@@ -501,7 +533,11 @@ impl OKXExecutionClient {
         Ok(())
     }
 
-    fn submit_order_http(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+    fn submit_order_http(
+        &self,
+        cmd: &SubmitOrder,
+        position_side: Option<PositionSide>,
+    ) -> anyhow::Result<()> {
         let order = {
             let cache = self.core.cache();
             cache.try_order_owned(&cmd.client_order_id)?
@@ -543,7 +579,7 @@ impl OKXExecutionClient {
                     Some(is_post_only),
                     None,
                     None,
-                    None,
+                    position_side,
                     None,
                     None,
                     None,
@@ -573,7 +609,11 @@ impl OKXExecutionClient {
         Ok(())
     }
 
-    fn submit_conditional_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+    fn submit_conditional_order(
+        &self,
+        cmd: &SubmitOrder,
+        position_side: Option<PositionSide>,
+    ) -> anyhow::Result<()> {
         let order = {
             let cache = self.core.cache();
             cache.try_order_owned(&cmd.client_order_id)?
@@ -646,6 +686,7 @@ impl OKXExecutionClient {
                     trigger_type,
                     price,
                     reduce_only,
+                    position_side,
                     close_fraction,
                     callback_ratio,
                     callback_spread,
@@ -1323,6 +1364,28 @@ impl OKXExecutionClient {
         }
         self.emitter.send_account_state(account_state);
 
+        if order_routing_types
+            .iter()
+            .any(|t| matches!(t, OKXInstrumentType::Swap | OKXInstrumentType::Futures))
+        {
+            let position_mode = self
+                .http_client
+                .request_position_mode()
+                .await
+                .context("failed to query OKX account position mode")?;
+            let is_hedge_mode = position_mode == OKXPositionMode::LongShortMode;
+            self.is_hedge_mode.store(is_hedge_mode, Ordering::Release);
+            log::info!("Position mode: {position_mode:?}");
+
+            if is_hedge_mode != (self.core.oms_type == OmsType::Hedging) {
+                log::warn!(
+                    "OKX account position mode does not match the configured OMS type: \
+                     position_mode={position_mode:?}, oms_type={:?}; set oms_type to match the account position mode",
+                    self.core.oms_type,
+                );
+            }
+        }
+
         // Wait for account to be registered in cache before completing connect
         self.await_account_registered(30.0).await?;
 
@@ -1922,7 +1985,7 @@ impl ExecutionClient for OKXExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        let route = {
+        let (route, position_side) = {
             let cache = self.core.cache();
             let order = cache.try_order(&cmd.client_order_id)?;
 
@@ -1937,19 +2000,27 @@ impl ExecutionClient for OKXExecutionClient {
                 return Ok(());
             }
 
+            let position_side = self.hedge_position_side(&*order, cmd.params.as_ref());
+            if let Err(reason) =
+                validate_submit_position_id(cmd.instrument_id, position_side, cmd.position_id)
+            {
+                self.emitter.emit_order_denied(&order, &reason.to_string());
+                return Ok(());
+            }
+
             let order_type = order.order_type();
             let route = self.submit_order_route(cmd.instrument_id, order_type)?;
 
             log::debug!("OrderSubmitted client_order_id={}", order.client_order_id());
             self.emitter.emit_order_submitted(&order);
 
-            route
+            (route, position_side)
         };
 
         match route {
-            OrderCommandRoute::RegularWs => self.submit_regular_order(&cmd),
-            OrderCommandRoute::AlgoHttp => self.submit_conditional_order(&cmd),
-            OrderCommandRoute::SpreadHttp => self.submit_order_http(&cmd),
+            OrderCommandRoute::RegularWs => self.submit_regular_order(&cmd, position_side),
+            OrderCommandRoute::AlgoHttp => self.submit_conditional_order(&cmd, position_side),
+            OrderCommandRoute::SpreadHttp => self.submit_order_http(&cmd, position_side),
         }
     }
 
@@ -1980,6 +2051,13 @@ impl ExecutionClient for OKXExecutionClient {
             .iter()
             .filter_map(|order| {
                 validate_order(order, trade_mode, OrderSubmission::List)
+                    .and_then(|()| {
+                        validate_submit_position_id(
+                            cmd.instrument_id,
+                            self.hedge_position_side(order, cmd.params.as_ref()),
+                            cmd.position_id,
+                        )
+                    })
                     .err()
                     .map(|reason| (order.client_order_id(), reason))
             })
@@ -2017,7 +2095,7 @@ impl ExecutionClient for OKXExecutionClient {
                 trade_mode,
                 context.identity.client_order_id,
                 context.identity.order_side,
-                None, // position_side: WS client defaults to Net for derivatives
+                self.hedge_position_side(order, cmd.params.as_ref()),
                 context.identity.order_type,
                 context.quantity,
                 context.price,
@@ -3173,6 +3251,30 @@ fn validate_order(
         }
     }
 
+    Ok(())
+}
+
+/// Denies a submitted `position_id` that conflicts with the venue position ID of the
+/// long/short mode leg the order routes to.
+fn validate_submit_position_id(
+    instrument_id: InstrumentId,
+    position_side: Option<PositionSide>,
+    submitted_position_id: Option<PositionId>,
+) -> Result<(), OrderDeniedReason> {
+    let venue_position_id = position_side
+        .and_then(|side| okx_venue_position_id(instrument_id, OKXPositionSide::from(side)));
+
+    if let (Some(submitted_position_id), Some(venue_position_id)) =
+        (submitted_position_id, venue_position_id)
+        && submitted_position_id != venue_position_id
+    {
+        return Err(OrderDeniedReason::InvalidPositionId {
+            position_id: submitted_position_id,
+            detail: format!(
+                "conflicts with OKX long/short mode venue position ID {venue_position_id}; omit position_id"
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -4914,6 +5016,253 @@ mod tests {
             )),
             "ambiguous algo submit failure should not emit OrderRejected: {events:?}",
         );
+    }
+
+    #[rstest]
+    #[case::net_mode_open(false, "BTC-USDT-SWAP.OKX", OrderSide::Buy, false, None)]
+    #[case::open_long(
+        true,
+        "BTC-USDT-SWAP.OKX",
+        OrderSide::Buy,
+        false,
+        Some(PositionSide::Long)
+    )]
+    #[case::open_short(
+        true,
+        "BTC-USDT-SWAP.OKX",
+        OrderSide::Sell,
+        false,
+        Some(PositionSide::Short)
+    )]
+    #[case::close_long(
+        true,
+        "BTC-USDT-SWAP.OKX",
+        OrderSide::Sell,
+        true,
+        Some(PositionSide::Long)
+    )]
+    #[case::close_short(
+        true,
+        "BTC-USDT-SWAP.OKX",
+        OrderSide::Buy,
+        true,
+        Some(PositionSide::Short)
+    )]
+    #[case::spot(true, "BTC-USDT.OKX", OrderSide::Buy, false, None)]
+    fn test_hedge_position_side_follows_account_position_mode(
+        #[case] is_hedge_mode: bool,
+        #[case] instrument_id: &str,
+        #[case] side: OrderSide,
+        #[case] reduce_only: bool,
+        #[case] expected: Option<PositionSide>,
+    ) {
+        let client = build_test_exec_client();
+        client.is_hedge_mode.store(is_hedge_mode, Ordering::Release);
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from(instrument_id))
+            .side(side)
+            .price(Price::from("100.00"))
+            .quantity(Quantity::from("1"))
+            .reduce_only(reduce_only)
+            .build();
+
+        assert_eq!(client.hedge_position_side(&order, None), expected);
+    }
+
+    #[rstest]
+    fn test_hedge_position_side_close_fraction_closes_opposite_leg() {
+        let client = build_test_exec_client();
+        client.is_hedge_mode.store(true, Ordering::Release);
+        let order = OrderTestBuilder::new(OrderType::StopMarket)
+            .instrument_id(InstrumentId::from("BTC-USDT-SWAP.OKX"))
+            .side(OrderSide::Buy)
+            .trigger_price(Price::from("100.00"))
+            .quantity(Quantity::from("1"))
+            .build();
+        let mut params = Params::new();
+        params.insert(
+            "close_fraction".to_string(),
+            serde_json::Value::String("1".to_string()),
+        );
+
+        assert_eq!(
+            client.hedge_position_side(&order, Some(&params)),
+            Some(PositionSide::Short),
+        );
+    }
+
+    #[rstest]
+    #[case::net_mode_ignores(None, Some("ANY-ID"), true)]
+    #[case::no_submitted_id(Some(PositionSide::Long), None, true)]
+    #[case::canonical_id(Some(PositionSide::Long), Some("BTC-USDT-SWAP.OKX-LONG"), true)]
+    #[case::other_leg(Some(PositionSide::Long), Some("BTC-USDT-SWAP.OKX-SHORT"), false)]
+    #[case::foreign_id(Some(PositionSide::Short), Some("P-123"), false)]
+    fn test_validate_submit_position_id(
+        #[case] position_side: Option<PositionSide>,
+        #[case] submitted: Option<&str>,
+        #[case] is_valid: bool,
+    ) {
+        let result = validate_submit_position_id(
+            InstrumentId::from("BTC-USDT-SWAP.OKX"),
+            position_side,
+            submitted.map(PositionId::from),
+        );
+
+        assert_eq!(result.is_ok(), is_valid, "{result:?}");
+        if let Err(reason) = result {
+            assert!(matches!(
+                reason,
+                OrderDeniedReason::InvalidPositionId { .. }
+            ));
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_submit_order_denies_conflicting_position_id_in_long_short_mode() {
+        let (mut client, cache) = build_test_exec_client_with_cache();
+        client.is_hedge_mode.store(true, Ordering::Release);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(event_tx);
+        let client_order_id = ClientOrderId::from("OHEDGEPOSID001");
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(client_order_id)
+            .instrument_id(InstrumentId::from("BTC-USDT-SWAP.OKX"))
+            .side(OrderSide::Buy)
+            .price(Price::from("100.00"))
+            .quantity(Quantity::from("1"))
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+            .unwrap();
+        let command = SubmitOrder::from_order(
+            &order,
+            TraderId::from("TESTER-001"),
+            Some(*OKX_CLIENT_ID),
+            Some(PositionId::from("BTC-USDT-SWAP.OKX-SHORT")),
+            UUID4::new(),
+            UnixNanos::default(),
+        );
+
+        client.submit_order(command).unwrap();
+
+        let event = event_rx.try_recv().expect("expected order denied");
+        let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = event else {
+            panic!("Expected OrderDenied, was {event:?}");
+        };
+        assert_eq!(denied.client_order_id, client_order_id);
+        assert!(
+            denied.reason.starts_with("INVALID_POSITION_ID"),
+            "{}",
+            denied.reason
+        );
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case::net_mode(false, None, true)]
+    #[case::long_short_mode(true, Some("long"), false)]
+    #[tokio::test]
+    async fn test_submit_conditional_order_sends_pos_side_for_account_position_mode(
+        #[case] is_hedge_mode: bool,
+        #[case] expected_pos_side: Option<&str>,
+        #[case] expects_reduce_only: bool,
+    ) {
+        let captured: Arc<std::sync::Mutex<Option<Value>>> = Arc::default();
+        let captured_handler = Arc::clone(&captured);
+        let router = Router::new().route(
+            "/api/v5/trade/order-algo",
+            post(move |Json(request): Json<Value>| {
+                let captured = Arc::clone(&captured_handler);
+                async move {
+                    let algo_cl_ord_id = request["algoClOrdId"].clone();
+                    *captured.lock().unwrap() = Some(request);
+                    Json(serde_json::json!({
+                        "code": "0",
+                        "msg": "",
+                        "data": [{
+                            "algoId": "3796251408639365121",
+                            "algoClOrdId": algo_cl_ord_id,
+                            "sCode": "0",
+                            "sMsg": "",
+                        }],
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url_http = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let config = OKXExecutionClientConfig {
+            api_key: Some("test_key".into()),
+            api_secret: Some("test_secret".into()),
+            api_passphrase: Some("test_pass".into()),
+            base_url_http: Some(base_url_http),
+            margin_mode: Some(OKXMarginMode::Cross),
+            ..OKXExecutionClientConfig::default()
+        };
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let core = ExecutionClientCore::new(
+            TraderId::from("TESTER-001"),
+            ClientId::from("OKX-TEST"),
+            *OKX_VENUE,
+            OmsType::Hedging,
+            config.account_id,
+            AccountType::Margin,
+            None,
+            Rc::clone(&cache),
+        );
+        let mut client = OKXExecutionClient::new(core, config).unwrap();
+        client.is_hedge_mode.store(is_hedge_mode, Ordering::Release);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(event_tx);
+        let client_order_id = ClientOrderId::from("OHEDGEALGO001");
+        let order = OrderTestBuilder::new(OrderType::StopMarket)
+            .client_order_id(client_order_id)
+            .instrument_id(InstrumentId::from("BTC-USDT-SWAP.OKX"))
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("0.01"))
+            .trigger_price(Price::from("95000"))
+            .reduce_only(true)
+            .build();
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+            .unwrap();
+        let command = SubmitOrder::from_order(
+            &order,
+            TraderId::from("TESTER-001"),
+            Some(*OKX_CLIENT_ID),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        );
+
+        client.submit_order(command).unwrap();
+        wait_until_async(
+            || async { captured.lock().unwrap().is_some() },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let request = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(request["posSide"].as_str(), expected_pos_side);
+        assert_eq!(request.get("reduceOnly").is_some(), expects_reduce_only);
+
+        wait_until_async(
+            || async { client.pending_tasks.all_finished() },
+            Duration::from_secs(5),
+        )
+        .await;
+        terminate_tasks(&client.pending_tasks, "test execution client")
+            .await
+            .expect("execution tasks terminated");
     }
 
     #[rstest]

@@ -2545,6 +2545,39 @@ async fn test_http_account_configuration_documented_values(
 }
 
 #[rstest]
+#[case("net_mode", OKXPositionMode::NetMode)]
+#[case("long_short_mode", OKXPositionMode::LongShortMode)]
+#[tokio::test]
+async fn test_http_request_position_mode(
+    #[case] position_mode: &str,
+    #[case] expected: OKXPositionMode,
+) {
+    let state = Arc::new(TestServerState::default());
+    let mut response = load_test_data("http_get_account_configuration.json");
+    response["data"][0]["posMode"] = json!(position_mode);
+    *state.account_configuration_response.lock().await =
+        Some((StatusCode::OK, response.to_string()));
+    let addr = start_test_server(state).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        5,
+        0,
+        1,
+        1,
+        OKXEnvironment::Demo,
+        None,
+    )
+    .unwrap();
+
+    let result = client.request_position_mode().await.unwrap();
+
+    assert_eq!(result, expected);
+}
+
+#[rstest]
 #[case("read_only", vec![OKXApiKeyPermission::ReadOnly])]
 #[case("trade", vec![OKXApiKeyPermission::Trade])]
 #[case("withdraw", vec![OKXApiKeyPermission::Withdraw])]
@@ -4998,6 +5031,7 @@ async fn test_http_place_algo_order_with_close_fraction_uses_conditional_close_o
             Some(TriggerType::Default),
             None,
             None,
+            None,
             Some("1".to_string()),
             None,
             None,
@@ -5025,6 +5059,70 @@ async fn test_http_place_algo_order_with_close_fraction_uses_conditional_close_o
     assert!(body.get("sz").is_none());
     assert!(body.get("triggerPx").is_none());
     assert!(body.get("orderPx").is_none());
+}
+
+#[rstest]
+#[case::open_long(OrderSide::Buy, Some(false), None, PositionSide::Long, "long")]
+#[case::close_long(OrderSide::Sell, Some(true), None, PositionSide::Long, "long")]
+#[case::close_short_fraction(OrderSide::Buy, Some(true), Some("1"), PositionSide::Short, "short")]
+#[tokio::test]
+async fn test_http_place_algo_order_long_short_mode_sends_pos_side(
+    #[case] order_side: OrderSide,
+    #[case] reduce_only: Option<bool>,
+    #[case] close_fraction: Option<&str>,
+    #[case] position_side: PositionSide,
+    #[case] expected_pos_side: &str,
+) {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_test_server(state.clone()).await;
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        3,
+        1000,
+        10_000,
+        OKXEnvironment::Live,
+        None,
+    )
+    .unwrap();
+
+    for instrument in load_swap_instruments_any() {
+        client.cache_instrument(instrument);
+    }
+
+    client
+        .place_algo_order_with_domain_types(
+            InstrumentId::from("BTC-USDT-SWAP.OKX"),
+            OKXTradeMode::Cross,
+            ClientOrderId::from("Ohedgealgo"),
+            order_side,
+            OrderType::StopMarket,
+            Quantity::from("0.01"),
+            Some(Price::from("50000")),
+            Some(TriggerType::Default),
+            None,
+            reduce_only,
+            Some(position_side),
+            close_fraction.map(str::to_string),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let body = state
+        .last_algo_order_body
+        .lock()
+        .await
+        .clone()
+        .expect("expected algo order payload");
+
+    assert_eq!(body["posSide"], expected_pos_side);
+    assert!(body.get("reduceOnly").is_none());
 }
 
 #[rstest]
@@ -5838,7 +5936,7 @@ async fn test_http_request_position_status_reports_preserves_long_short_legs() {
     );
     assert_eq!(
         reports[0].venue_position_id,
-        Some(PositionId::new("12345-LONG")),
+        Some(PositionId::new(format!("{instrument_id}-LONG"))),
     );
     assert_eq!(
         reports[0].avg_px_open,
@@ -5859,7 +5957,7 @@ async fn test_http_request_position_status_reports_preserves_long_short_legs() {
     );
     assert_eq!(
         reports[1].venue_position_id,
-        Some(PositionId::new("67890-SHORT")),
+        Some(PositionId::new(format!("{instrument_id}-SHORT"))),
     );
     assert_eq!(
         reports[1].avg_px_open,
@@ -7908,6 +8006,7 @@ async fn test_http_place_algo_order_returns_error_on_nonzero_scode() {
             Quantity::from("0.01"),
             Some(Price::from("50000")),
             Some(TriggerType::Default),
+            None,
             None,
             None,
             None,

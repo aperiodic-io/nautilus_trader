@@ -1300,6 +1300,9 @@ pub struct OKXTransactionDetail {
     pub fill_sz: String,
     /// Trade side: buy or sell.
     pub side: OKXSide,
+    /// Position side: `long` or `short` in long/short mode, `net` in net mode.
+    #[serde(default)]
+    pub pos_side: Option<OKXPositionSide>,
     /// Execution type.
     pub exec_type: OKXExecType,
     /// Fee currency.
