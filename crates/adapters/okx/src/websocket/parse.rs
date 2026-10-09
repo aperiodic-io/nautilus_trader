@@ -61,8 +61,8 @@ use crate::{
         models::OKXInstrument,
         parse::{
             determine_order_type_with_alt, is_market_price, okx_channel_to_bar_spec,
-            okx_status_to_market_action, parse_fee, parse_fee_currency, parse_funding_rate_msg,
-            parse_instrument_any, parse_instrument_id, parse_message_vec,
+            okx_status_to_market_action, okx_venue_position_id, parse_fee, parse_fee_currency,
+            parse_funding_rate_msg, parse_instrument_any, parse_instrument_id, parse_message_vec,
             parse_millisecond_timestamp, parse_parent_client_order_id, parse_price, parse_quantity,
             parse_spread_order_status_report as parse_common_spread_order_status_report,
         },
@@ -1674,6 +1674,10 @@ pub fn parse_algo_order_status_report(
         report = report.with_reduce_only(true);
     }
 
+    if let Some(venue_position_id) = okx_venue_position_id(instrument.id(), msg.pos_side) {
+        report = report.with_venue_position_id(venue_position_id);
+    }
+
     Ok(report)
 }
 
@@ -2037,6 +2041,10 @@ pub fn parse_order_status_report(
         report = report.with_cancel_reason(reason);
     }
 
+    if let Some(venue_position_id) = okx_venue_position_id(instrument.id(), msg.pos_side) {
+        report = report.with_venue_position_id(venue_position_id);
+    }
+
     Ok(report)
 }
 
@@ -2294,7 +2302,7 @@ pub fn parse_fill_report(
         commission,
         liquidity_side,
         client_order_id,
-        None,
+        okx_venue_position_id(instrument.id(), msg.pos_side),
         ts_event,
         ts_init,
         None, // Generate UUID4 automatically
@@ -3643,6 +3651,40 @@ mod tests {
         assert_eq!(fill_report.last_px, Price::from("103698.90"));
         assert_eq!(fill_report.last_qty, Quantity::from("0.03000000"));
         assert_eq!(fill_report.liquidity_side, LiquiditySide::Maker);
+    }
+
+    #[rstest]
+    #[case(OKXPositionSide::Long, Some("BTC-USDT-SWAP.OKX-LONG"))]
+    #[case(OKXPositionSide::Short, Some("BTC-USDT-SWAP.OKX-SHORT"))]
+    #[case(OKXPositionSide::Net, None)]
+    fn test_parse_reports_venue_position_id_follows_pos_side(
+        #[case] pos_side: OKXPositionSide,
+        #[case] expected: Option<&str>,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(create_stub_instrument());
+        let ws_msg: serde_json::Value =
+            serde_json::from_str(&load_test_json("ws_orders.json")).unwrap();
+        let data: Vec<OKXOrderMsg> = serde_json::from_value(ws_msg["data"].clone()).unwrap();
+        let mut msg = data[0].clone();
+        msg.pos_side = pos_side;
+        let account_id = AccountId::new("OKX-001");
+        let expected = expected.map(nautilus_model::identifiers::PositionId::new);
+
+        let fill_report = parse_fill_report(
+            &msg,
+            &instrument,
+            account_id,
+            None,
+            None,
+            UnixNanos::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let status_report =
+            parse_order_status_report(&msg, &instrument, account_id, UnixNanos::default()).unwrap();
+
+        assert_eq!(fill_report.venue_position_id, expected);
+        assert_eq!(status_report.venue_position_id, expected);
     }
 
     #[rstest]

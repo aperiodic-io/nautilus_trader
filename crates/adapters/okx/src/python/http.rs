@@ -1194,6 +1194,7 @@ impl OKXHttpClient {
                     trigger_type,
                     limit_price,
                     reduce_only,
+                    None, // position_side
                     close_fraction,
                     callback_ratio,
                     callback_spread,

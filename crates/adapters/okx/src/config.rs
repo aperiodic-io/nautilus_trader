@@ -17,7 +17,7 @@
 
 use nautilus_core::string::secret::SecretString;
 use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
-use nautilus_model::identifiers::AccountId;
+use nautilus_model::{enums::OmsType, identifiers::AccountId};
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
@@ -257,6 +257,11 @@ pub struct OKXExecutionClientConfig {
     /// Enables margin/leverage for SPOT trading when true.
     #[builder(default)]
     pub use_spot_margin: bool,
+    /// Optional OMS type override.
+    ///
+    /// Set to `Hedging` when the account uses long/short position mode. When
+    /// `None`, the client uses `Netting` for derivatives and `Hedging` otherwise.
+    pub oms_type: Option<OmsType>,
     /// Optional SPOT `tradeQuoteCcy` override sent on order payloads.
     ///
     /// Unset omits the field so OKX uses the quote currency in `instId` (USDC
@@ -286,6 +291,7 @@ nautilus_core::impl_pyo3_config_getters!(OKXExecutionClientConfig {
     retry_delay_initial_ms: u64,
     retry_delay_max_ms: u64,
     margin_mode: Option<OKXMarginMode>,
+    oms_type: Option<OmsType>,
     load_spreads: bool,
     auth_timeout_secs: Option<u64>,
     transport_backend: TransportBackend,
@@ -482,7 +488,20 @@ book_snapshot_timeout_secs = 4
         assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
         assert_eq!(config.load_spreads, expected.load_spreads);
         assert_eq!(config.use_mm_mass_cancel, expected.use_mm_mass_cancel);
+        assert_eq!(config.oms_type, expected.oms_type);
         assert_eq!(config.transport_backend, expected.transport_backend);
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_oms_type_override() {
+        let config: OKXExecutionClientConfig = toml::from_str(
+            r#"
+oms_type = "Hedging"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.oms_type, Some(OmsType::Hedging));
     }
 
     #[rstest]

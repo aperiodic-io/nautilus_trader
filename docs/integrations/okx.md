@@ -786,6 +786,18 @@ modes when reporting positions: in net mode it derives the position side from th
 quantity, and in long/short mode it uses the `posSide` reported by OKX.
 :::
 
+When the execution client loads `SWAP` or `FUTURES` instruments, it reads the account position
+mode from `GET /api/v5/account/config` on connect. In long/short mode it sends `posSide` on every
+swap and futures order: an opening order uses the leg matching its side (buy opens `long`, sell
+opens `short`), and a reduce-only order closes the opposite leg (sell closes `long`, buy closes
+`short`). Orders, fills, and position reports for a leg carry the venue position ID
+`{instrument_id}-LONG` or `{instrument_id}-SHORT`. Leave `position_id` unset on submitted orders,
+or set it to that ID; the client denies an order whose `position_id` names a different position.
+
+Set `oms_type=OmsType.HEDGING` on the execution client config for a long/short mode account. The
+client logs a warning on connect when the account position mode and the configured OMS type
+disagree.
+
 ### Trade modes and margin configuration
 
 OKX's unified account system supports different trade modes for spot and derivatives. Configure
@@ -1481,6 +1493,7 @@ The OKX execution client provides the following Python configuration options.
 | `environment`            | `LIVE`                     | Environment enum (`LIVE` or `DEMO`).                                                                    |
 | `region`                 | `GLOBAL`                   | Region enum (`GLOBAL`, `EEA`, or `US`).                                                                 |
 | `margin_mode`            | `None`                     | Margin mode (`ISOLATED` or `CROSS`).                                                                    |
+| `oms_type`               | `None`                     | OMS type override. Set `HEDGING` for long/short position mode accounts.                                 |
 | `spot_trade_quote_ccy`   | `None`                     | SPOT `tradeQuoteCcy` override. Set `"USD"` to keep USD after migrating to `Crypto-USDC`.                |
 | `http_timeout_secs`      | `60`                       | REST trading request timeout.                                                                           |
 | `max_retries`            | `3`                        | Retry attempts for recoverable REST errors. Order submission endpoints are exempt and always send once. |

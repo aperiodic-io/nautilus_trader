@@ -278,6 +278,50 @@ pub fn okx_instrument_type_from_symbol(symbol: &str) -> OKXInstrumentType {
     }
 }
 
+/// Returns the `posSide` for an order on an account in long/short position mode.
+///
+/// In long/short mode OKX requires `posSide` to be `long` or `short` on SWAP and FUTURES
+/// orders. An opening order uses the leg matching its side, while a reduce-only order closes
+/// the opposite leg. Returns `None` in net mode and for other instrument types, which keep
+/// their existing `posSide` handling.
+#[must_use]
+pub fn okx_hedge_position_side(
+    is_hedge_mode: bool,
+    instrument_type: OKXInstrumentType,
+    order_side: OrderSide,
+    is_closing: bool,
+) -> Option<PositionSide> {
+    if !is_hedge_mode
+        || !matches!(
+            instrument_type,
+            OKXInstrumentType::Swap | OKXInstrumentType::Futures
+        )
+    {
+        return None;
+    }
+
+    Some(match (order_side, is_closing) {
+        (OrderSide::Buy, false) | (OrderSide::Sell, true) => PositionSide::Long,
+        (OrderSide::Sell, false) | (OrderSide::Buy, true) => PositionSide::Short,
+    })
+}
+
+/// Returns the venue position ID for an OKX long/short mode position leg.
+///
+/// Each leg maps to `{instrument_id}-LONG` or `{instrument_id}-SHORT`, so that orders, fills,
+/// and position reports for the same leg share one ID. Net mode positions return `None`.
+#[must_use]
+pub fn okx_venue_position_id(
+    instrument_id: InstrumentId,
+    pos_side: OKXPositionSide,
+) -> Option<PositionId> {
+    match pos_side {
+        OKXPositionSide::Long => Some(PositionId::new(format!("{instrument_id}-LONG"))),
+        OKXPositionSide::Short => Some(PositionId::new(format!("{instrument_id}-SHORT"))),
+        OKXPositionSide::Net | OKXPositionSide::None => None,
+    }
+}
+
 /// Extracts base and quote currencies from an OKX symbol.
 ///
 /// All OKX instrument symbols start with {BASE}-{QUOTE}, regardless of type.
@@ -932,6 +976,10 @@ pub fn parse_order_status_report(
         report = report.with_linked_order_ids(linked_ids);
     }
 
+    if let Some(venue_position_id) = okx_venue_position_id(instrument_id, order.pos_side) {
+        report = report.with_venue_position_id(venue_position_id);
+    }
+
     Ok(report)
 }
 
@@ -1023,7 +1071,8 @@ pub fn parse_spot_margin_position_from_balance(
 ///
 /// - **Long/Short mode** (`posSide="long"` or `"short"`): The `pos` field is always
 ///   positive regardless of side. Position side is determined from the `posSide` field.
-///   Position IDs are suffixed with `-LONG` or `-SHORT` for uniqueness.
+///   Position IDs are the instrument ID suffixed with `-LONG` or `-SHORT`, matching the IDs
+///   carried by order and fill reports for the same leg.
 ///
 /// See: <https://www.okx.com/docs-v5/en/#trading-account-rest-api-get-positions>
 ///
@@ -1120,24 +1169,7 @@ pub fn parse_position_status_report(
 
     // Generate venue position ID only for Long/Short mode (hedging)
     // In Net mode, venue_position_id must be None to signal NETTING OMS behavior
-    let venue_position_id = match position.pos_side {
-        OKXPositionSide::Long => {
-            // Long/Short mode - Long leg: append "-LONG"
-            position
-                .pos_id
-                .map(|pos_id| PositionId::new(format!("{pos_id}-LONG")))
-        }
-        OKXPositionSide::Short => {
-            // Long/Short mode - Short leg: append "-SHORT"
-            position
-                .pos_id
-                .map(|pos_id| PositionId::new(format!("{pos_id}-SHORT")))
-        }
-        OKXPositionSide::Net | OKXPositionSide::None => {
-            // Net mode: None signals NETTING OMS (Nautilus uses its own position IDs)
-            None
-        }
-    };
+    let venue_position_id = okx_venue_position_id(instrument_id, position.pos_side);
 
     let avg_px_open = if position.avg_px.is_empty() {
         None
@@ -1203,7 +1235,9 @@ pub fn parse_fill_report(
         commission,
         liquidity_side,
         client_order_id,
-        None, // venue_position_id not provided by OKX fills
+        detail
+            .pos_side
+            .and_then(|pos_side| okx_venue_position_id(instrument_id, pos_side)),
         ts_event,
         ts_init,
         None, // Will generate a new UUID4
@@ -4626,6 +4660,7 @@ mod tests {
             fill_px: "42219.5".to_string(),
             fill_sz: "0.001".to_string(),
             side: OKXSide::Buy,
+            pos_side: None,
             exec_type: OKXExecType::Taker,
             fee_ccy: "USDT".to_string(),
             fee: Some("0.042".to_string()),
@@ -4655,6 +4690,144 @@ mod tests {
         assert_eq!(
             fill_report.commission,
             Money::from_decimal(dec!(-0.042), Currency::USDT()).unwrap()
+        );
+    }
+
+    #[rstest]
+    #[case(Some(OKXPositionSide::Long), Some("BTC-USDT-SWAP.OKX-LONG"))]
+    #[case(Some(OKXPositionSide::Short), Some("BTC-USDT-SWAP.OKX-SHORT"))]
+    #[case(Some(OKXPositionSide::Net), None)]
+    #[case(None, None)]
+    fn test_fill_report_venue_position_id_follows_pos_side(
+        #[case] pos_side: Option<OKXPositionSide>,
+        #[case] expected: Option<&str>,
+    ) {
+        let detail = crate::http::models::OKXTransactionDetail {
+            inst_type: OKXInstrumentType::Swap,
+            inst_id: Ustr::from("BTC-USDT-SWAP"),
+            trade_id: Ustr::from("12345"),
+            ord_id: Ustr::from("67890"),
+            cl_ord_id: Ustr::from("client_123"),
+            bill_id: Ustr::from("bill_456"),
+            fill_px: "42219.5".to_string(),
+            fill_sz: "1".to_string(),
+            side: OKXSide::Sell,
+            pos_side,
+            exec_type: OKXExecType::Maker,
+            fee_ccy: "USDT".to_string(),
+            fee: Some("-0.01".to_string()),
+            ts: 1_625_097_600_000,
+        };
+
+        let fill_report = parse_fill_report(
+            &detail,
+            AccountId::new("OKX-001"),
+            InstrumentId::from("BTC-USDT-SWAP.OKX"),
+            1,
+            0,
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        assert_eq!(fill_report.venue_position_id, expected.map(PositionId::new));
+    }
+
+    #[rstest]
+    fn test_transaction_detail_deserializes_pos_side() {
+        let json = r#"{
+            "instType": "SWAP",
+            "instId": "BTC-USDT-SWAP",
+            "tradeId": "1",
+            "ordId": "2",
+            "clOrdId": "",
+            "billId": "3",
+            "fillPx": "100",
+            "fillSz": "1",
+            "side": "buy",
+            "posSide": "long",
+            "execType": "T",
+            "feeCcy": "USDT",
+            "fee": "-0.01",
+            "ts": "1625097600000"
+        }"#;
+
+        let detail: OKXTransactionDetail = serde_json::from_str(json).unwrap();
+
+        assert_eq!(detail.pos_side, Some(OKXPositionSide::Long));
+    }
+
+    #[rstest]
+    #[case(false, OKXInstrumentType::Swap, OrderSide::Buy, false, None)]
+    #[case(
+        true,
+        OKXInstrumentType::Swap,
+        OrderSide::Buy,
+        false,
+        Some(PositionSide::Long)
+    )]
+    #[case(
+        true,
+        OKXInstrumentType::Swap,
+        OrderSide::Sell,
+        false,
+        Some(PositionSide::Short)
+    )]
+    #[case(
+        true,
+        OKXInstrumentType::Swap,
+        OrderSide::Buy,
+        true,
+        Some(PositionSide::Short)
+    )]
+    #[case(
+        true,
+        OKXInstrumentType::Swap,
+        OrderSide::Sell,
+        true,
+        Some(PositionSide::Long)
+    )]
+    #[case(
+        true,
+        OKXInstrumentType::Futures,
+        OrderSide::Buy,
+        false,
+        Some(PositionSide::Long)
+    )]
+    #[case(
+        true,
+        OKXInstrumentType::Futures,
+        OrderSide::Buy,
+        true,
+        Some(PositionSide::Short)
+    )]
+    #[case(true, OKXInstrumentType::Spot, OrderSide::Buy, false, None)]
+    #[case(true, OKXInstrumentType::Margin, OrderSide::Sell, true, None)]
+    #[case(true, OKXInstrumentType::Option, OrderSide::Buy, false, None)]
+    fn test_okx_hedge_position_side(
+        #[case] is_hedge_mode: bool,
+        #[case] instrument_type: OKXInstrumentType,
+        #[case] order_side: OrderSide,
+        #[case] is_closing: bool,
+        #[case] expected: Option<PositionSide>,
+    ) {
+        assert_eq!(
+            okx_hedge_position_side(is_hedge_mode, instrument_type, order_side, is_closing),
+            expected,
+        );
+    }
+
+    #[rstest]
+    #[case(OKXPositionSide::Long, Some("ETH-USDT-SWAP.OKX-LONG"))]
+    #[case(OKXPositionSide::Short, Some("ETH-USDT-SWAP.OKX-SHORT"))]
+    #[case(OKXPositionSide::Net, None)]
+    #[case(OKXPositionSide::None, None)]
+    fn test_okx_venue_position_id(
+        #[case] pos_side: OKXPositionSide,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            okx_venue_position_id(InstrumentId::from("ETH-USDT-SWAP.OKX"), pos_side),
+            expected.map(PositionId::new),
         );
     }
 
@@ -5110,7 +5283,7 @@ mod tests {
         // Long/Short mode - Long leg: "-LONG" suffix
         assert_eq!(
             report.venue_position_id,
-            Some(PositionId::new("11111-LONG"))
+            Some(PositionId::new("BTC-USDT-SWAP.OKX-LONG"))
         );
     }
 
@@ -5188,7 +5361,7 @@ mod tests {
         // Long/Short mode - Short leg: "-SHORT" suffix
         assert_eq!(
             report.venue_position_id,
-            Some(PositionId::new("22222-SHORT"))
+            Some(PositionId::new("BTC-USDT-SWAP.OKX-SHORT"))
         );
     }
 

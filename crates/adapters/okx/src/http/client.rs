@@ -2506,6 +2506,24 @@ impl OKXHttpClient {
         Ok(account_state)
     }
 
+    /// Requests the account position mode from `GET /api/v5/account/config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response contains no account
+    /// configuration.
+    pub async fn request_position_mode(&self) -> anyhow::Result<OKXPositionMode> {
+        let configurations = self
+            .inner
+            .get_account_configuration()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        configurations
+            .first()
+            .map(|configuration| configuration.position_mode)
+            .ok_or_else(|| anyhow::anyhow!("OKX account configuration response was empty"))
+    }
+
     /// Sets the position mode for the account.
     ///
     /// Defaults to `NetMode` if no position mode is provided.
@@ -6553,6 +6571,7 @@ impl OKXHttpClient {
         trigger_type: Option<TriggerType>,
         limit_price: Option<Price>,
         reduce_only: Option<bool>,
+        position_side: Option<PositionSide>,
         close_fraction: Option<String>,
         callback_ratio: Option<String>,
         callback_spread: Option<String>,
@@ -6651,8 +6670,9 @@ impl OKXHttpClient {
                 tp_trigger_px,
                 tp_ord_px,
                 tp_trigger_px_type,
-                Some(OKXPositionSide::Net),
-                Some(true),
+                Some(position_side.map_or(OKXPositionSide::Net, Into::into)),
+                // A closing side and posSide enforce reduce-only in long/short mode
+                position_side.is_none().then_some(true),
             )
         } else {
             let algo_type = conditional_order_to_algo_type(order_type)
@@ -6679,8 +6699,13 @@ impl OKXHttpClient {
                 None,
                 None,
                 None,
-                None,
-                reduce_only,
+                position_side.map(Into::into),
+                // A closing side and posSide enforce reduce-only in long/short mode
+                if position_side.is_some() {
+                    None
+                } else {
+                    reduce_only
+                },
             )
         };
 
