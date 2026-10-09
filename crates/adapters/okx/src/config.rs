@@ -270,6 +270,14 @@ pub struct OKXExecutionClientConfig {
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Optional maximum number of order, algo order, and fill history pages to request per
+    /// history query during execution mass status reconciliation.
+    ///
+    /// Unset keeps the safety cap of 50 pages, and larger values are capped to it. `0` skips
+    /// the history queries entirely. Pending orders, live algo orders, and positions are
+    /// always requested in full. Truncated or skipped history marks the mass status reports
+    /// incomplete.
+    pub max_reconciliation_history_pages: Option<u32>,
 }
 
 #[cfg(feature = "python")]
@@ -290,6 +298,7 @@ nautilus_core::impl_pyo3_config_getters!(OKXExecutionClientConfig {
     auth_timeout_secs: Option<u64>,
     transport_backend: TransportBackend,
     spot_trade_quote_ccy: Option<String>,
+    max_reconciliation_history_pages: Option<u32>,
 });
 
 impl Default for OKXExecutionClientConfig {
@@ -483,6 +492,7 @@ book_snapshot_timeout_secs = 4
         assert_eq!(config.load_spreads, expected.load_spreads);
         assert_eq!(config.use_mm_mass_cancel, expected.use_mm_mass_cancel);
         assert_eq!(config.transport_backend, expected.transport_backend);
+        assert_eq!(config.max_reconciliation_history_pages, None);
     }
 
     #[rstest]
@@ -503,6 +513,19 @@ load_spreads = true
         .unwrap();
 
         assert!(config.load_spreads);
+    }
+
+    #[rstest]
+    #[case::skipped("max_reconciliation_history_pages = 0\n", Some(0))]
+    #[case::limited("max_reconciliation_history_pages = 5\n", Some(5))]
+    #[case::unset("", None)]
+    fn test_exec_config_toml_max_reconciliation_history_pages(
+        #[case] toml_str: &str,
+        #[case] expected: Option<u32>,
+    ) {
+        let config: OKXExecutionClientConfig = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(config.max_reconciliation_history_pages, expected);
     }
 
     #[rstest]

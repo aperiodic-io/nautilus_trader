@@ -320,9 +320,9 @@ mod tests {
     use serde::{Serialize, Serializer, ser::Error as _};
 
     use super::{
-        Method, OKXEnvironment, OKXHttpError, OKXInstrumentDefinitionError, OKXRawHttpClient,
-        Timestamp, deserialize_okx_response, parse_retry_after, resolve_okx_error_code,
-        resolve_okx_error_message,
+        MAX_RECONCILIATION_PAGES, Method, OKXEnvironment, OKXHttpError,
+        OKXInstrumentDefinitionError, OKXRawHttpClient, Timestamp, deserialize_okx_response,
+        history_page_budget, parse_retry_after, resolve_okx_error_code, resolve_okx_error_message,
     };
     use crate::http::models::OKXFeeRate;
 
@@ -335,6 +335,16 @@ mod tests {
         {
             Err(S::Error::custom("intentional serialization failure"))
         }
+    }
+
+    #[rstest]
+    #[case::default_cap(None, MAX_RECONCILIATION_PAGES)]
+    #[case::skipped(Some(0), 0)]
+    #[case::limited(Some(3), 3)]
+    #[case::at_cap(Some(50), MAX_RECONCILIATION_PAGES)]
+    #[case::above_cap(Some(500), MAX_RECONCILIATION_PAGES)]
+    fn test_history_page_budget(#[case] limit: Option<u32>, #[case] expected: usize) {
+        assert_eq!(history_page_budget(limit), expected);
     }
 
     #[tokio::test]
@@ -587,6 +597,36 @@ impl<T> PageSweep<T> {
             complete: !exhausted || items.is_empty(),
             items,
         }
+    }
+
+    // A history sweep with a zero page budget: nothing was requested, so nothing is proven
+    const fn skipped() -> Self {
+        Self {
+            items: Vec::new(),
+            complete: false,
+        }
+    }
+}
+
+// Returns how many pages a history sweep may request: the safety cap, or a lower
+// configured `history_page_limit`
+fn history_page_budget(history_page_limit: Option<u32>) -> usize {
+    history_page_limit.map_or(MAX_RECONCILIATION_PAGES, |pages| {
+        (pages as usize).min(MAX_RECONCILIATION_PAGES)
+    })
+}
+
+fn log_history_page_cap(kind: &str, budget: usize, records: usize) {
+    if budget < MAX_RECONCILIATION_PAGES {
+        log::debug!(
+            "{kind} pagination reached the configured {budget} page limit, \
+             results may be truncated ({records} records)"
+        );
+    } else {
+        log::warn!(
+            "{kind} pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
+             results may be truncated ({records} records)"
+        );
     }
 }
 
@@ -4300,6 +4340,7 @@ impl OKXHttpClient {
                 open_only,
                 limit,
                 None,
+                None,
             )
             .await?
             .reports)
@@ -4316,6 +4357,7 @@ impl OKXHttpClient {
         open_only: bool,
         limit: Option<u32>,
         scope: Option<ReportInstrumentScope<'_>>,
+        history_page_limit: Option<u32>,
     ) -> anyhow::Result<ReportSweep<OrderStatusReport>> {
         if instrument_id
             .as_ref()
@@ -4331,6 +4373,7 @@ impl OKXHttpClient {
                     open_only,
                     limit,
                     scope,
+                    history_page_limit,
                 )
                 .await;
         }
@@ -4367,7 +4410,7 @@ impl OKXHttpClient {
         } else {
             let (history, pending) = Box::pin(async {
                 tokio::try_join!(
-                    self.paginate_orders_history(&history_base, limit),
+                    self.paginate_orders_history(&history_base, limit, history_page_limit),
                     self.paginate_orders_pending(&pending_base, limit),
                 )
             })
@@ -4610,6 +4653,7 @@ impl OKXHttpClient {
                 open_only,
                 limit,
                 None,
+                None,
             )
             .await?
             .reports)
@@ -4625,6 +4669,7 @@ impl OKXHttpClient {
         open_only: bool,
         limit: Option<u32>,
         scope: Option<ReportInstrumentScope<'_>>,
+        history_page_limit: Option<u32>,
     ) -> anyhow::Result<ReportSweep<OrderStatusReport>> {
         let mut pending_builder = GetSpreadOrdersParamsBuilder::default();
         let mut history_builder = GetSpreadOrdersParamsBuilder::default();
@@ -4659,7 +4704,7 @@ impl OKXHttpClient {
         } else {
             let (history, pending) = Box::pin(async {
                 tokio::try_join!(
-                    self.paginate_spread_orders_history(&history_base, limit),
+                    self.paginate_spread_orders_history(&history_base, limit, history_page_limit),
                     self.paginate_spread_orders_pending(&pending_base, limit),
                 )
             })
@@ -4750,12 +4795,18 @@ impl OKXHttpClient {
         &self,
         base: &GetSpreadOrdersParams,
         limit: Option<u32>,
+        history_page_limit: Option<u32>,
     ) -> anyhow::Result<PageSweep<OKXSpreadOrder>> {
+        let budget = history_page_budget(history_page_limit);
+        if budget == 0 {
+            return Ok(PageSweep::skipped());
+        }
+
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..budget {
             let mut params = base.clone();
             params.end_id = cursor.take();
 
@@ -4783,11 +4834,7 @@ impl OKXHttpClient {
         }
 
         if exhausted && !all.is_empty() {
-            log::warn!(
-                "Spread order history pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
-                 results may be truncated ({} records)",
-                all.len()
-            );
+            log_history_page_cap("Spread order history", budget, all.len());
         }
 
         if let Some(lim) = limit {
@@ -4853,12 +4900,18 @@ impl OKXHttpClient {
         &self,
         base: &GetOrderHistoryParams,
         limit: Option<u32>,
+        history_page_limit: Option<u32>,
     ) -> anyhow::Result<PageSweep<OKXOrderHistory>> {
+        let budget = history_page_budget(history_page_limit);
+        if budget == 0 {
+            return Ok(PageSweep::skipped());
+        }
+
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..budget {
             let mut params = base.clone();
             params.after = cursor.take();
 
@@ -4886,11 +4939,7 @@ impl OKXHttpClient {
         }
 
         if exhausted && !all.is_empty() {
-            log::warn!(
-                "Order history pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
-                 results may be truncated ({} records)",
-                all.len()
-            );
+            log_history_page_cap("Order history", budget, all.len());
         }
 
         if let Some(lim) = limit {
@@ -4958,12 +5007,18 @@ impl OKXHttpClient {
         base: &GetTransactionDetailsParams,
         limit: Option<u32>,
         history: FillHistory,
+        history_page_limit: Option<u32>,
     ) -> anyhow::Result<PageSweep<OKXTransactionDetail>> {
+        let budget = history_page_budget(history_page_limit);
+        if budget == 0 {
+            return Ok(PageSweep::skipped());
+        }
+
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..budget {
             let mut params = base.clone();
             params.after = cursor.take();
 
@@ -4991,11 +5046,7 @@ impl OKXHttpClient {
         }
 
         if exhausted && !all.is_empty() {
-            log::warn!(
-                "Fill pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
-                 results may be truncated ({} records)",
-                all.len()
-            );
+            log_history_page_cap("Fill", budget, all.len());
         }
 
         if let Some(lim) = limit {
@@ -5065,12 +5116,18 @@ impl OKXHttpClient {
         base: &GetAlgoOrdersParams,
         limit: Option<usize>,
         require_complete_active_coverage: bool,
+        history_page_limit: Option<u32>,
     ) -> anyhow::Result<PageSweep<OKXOrderAlgo>> {
+        let budget = history_page_budget(history_page_limit);
+        if budget == 0 {
+            return Ok(PageSweep::skipped());
+        }
+
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..budget {
             let mut params = base.clone();
             params.after = cursor.take();
 
@@ -5103,11 +5160,7 @@ impl OKXHttpClient {
         }
 
         if exhausted && !all.is_empty() {
-            log::warn!(
-                "Algo history pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
-                 results may be truncated ({} records)",
-                all.len()
-            );
+            log_history_page_cap("Algo history", budget, all.len());
         }
 
         Ok(PageSweep::from_pages(all, exhausted))
@@ -5141,6 +5194,7 @@ impl OKXHttpClient {
                 limit,
                 FillHistory::Recent,
                 None,
+                None,
             )
             .await?
             .reports)
@@ -5157,6 +5211,7 @@ impl OKXHttpClient {
         limit: Option<u32>,
         history: FillHistory,
         scope: Option<ReportInstrumentScope<'_>>,
+        history_page_limit: Option<u32>,
     ) -> anyhow::Result<ReportSweep<FillReport>> {
         if instrument_id
             .as_ref()
@@ -5171,6 +5226,7 @@ impl OKXHttpClient {
                     end,
                     limit,
                     scope,
+                    history_page_limit,
                 )
                 .await;
         }
@@ -5206,7 +5262,9 @@ impl OKXHttpClient {
 
         let params = params.build().map_err(|e| anyhow::anyhow!(e))?;
 
-        let sweep = self.paginate_fills(&params, limit, history).await?;
+        let sweep = self
+            .paginate_fills(&params, limit, history, history_page_limit)
+            .await?;
         let mut complete = sweep.complete;
 
         // Prepare time range filter
@@ -5297,11 +5355,20 @@ impl OKXHttpClient {
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<FillReport>> {
         Ok(self
-            .request_spread_fill_reports_scoped(account_id, instrument_id, start, end, limit, None)
+            .request_spread_fill_reports_scoped(
+                account_id,
+                instrument_id,
+                start,
+                end,
+                limit,
+                None,
+                None,
+            )
             .await?
             .reports)
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn request_spread_fill_reports_scoped(
         &self,
         account_id: AccountId,
@@ -5310,6 +5377,7 @@ impl OKXHttpClient {
         end: Option<Timestamp>,
         limit: Option<u32>,
         scope: Option<ReportInstrumentScope<'_>>,
+        history_page_limit: Option<u32>,
     ) -> anyhow::Result<ReportSweep<FillReport>> {
         let mut builder = GetSpreadTradesParamsBuilder::default();
 
@@ -5330,7 +5398,9 @@ impl OKXHttpClient {
         }
 
         let params = builder.build().map_err(|e| anyhow::anyhow!(e))?;
-        let sweep = self.paginate_spread_fills(&params, limit).await?;
+        let sweep = self
+            .paginate_spread_fills(&params, limit, history_page_limit)
+            .await?;
         let mut complete = sweep.complete;
 
         let start_ns = start.map(UnixNanos::from);
@@ -5408,12 +5478,18 @@ impl OKXHttpClient {
         &self,
         base: &GetSpreadTradesParams,
         limit: Option<u32>,
+        history_page_limit: Option<u32>,
     ) -> anyhow::Result<PageSweep<OKXSpreadTrade>> {
+        let budget = history_page_budget(history_page_limit);
+        if budget == 0 {
+            return Ok(PageSweep::skipped());
+        }
+
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..budget {
             let mut params = base.clone();
             params.end_id = cursor.take();
 
@@ -5441,11 +5517,7 @@ impl OKXHttpClient {
         }
 
         if exhausted && !all.is_empty() {
-            log::warn!(
-                "Spread fill pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
-                 results may be truncated ({} records)",
-                all.len()
-            );
+            log_history_page_cap("Spread fill", budget, all.len());
         }
 
         if let Some(lim) = limit {
@@ -6766,6 +6838,7 @@ impl OKXHttpClient {
                 None,
                 None,
                 false,
+                None,
             )
             .await?
             .reports)
@@ -6784,6 +6857,7 @@ impl OKXHttpClient {
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         require_complete_active_coverage: bool,
+        history_page_limit: Option<u32>,
     ) -> anyhow::Result<AlgoOrderReportSweep> {
         let mut instruments_cache: AHashMap<Ustr, InstrumentAny> = AHashMap::new();
         let mut ambiguous_triggered_child_ids = AHashSet::new();
@@ -6980,7 +7054,12 @@ impl OKXHttpClient {
                 params.state = Some(*history_state);
                 let remaining = limit.map(|l| (l as usize).saturating_sub(reports.len()));
                 let history_sweep = match self
-                    .paginate_algo_history(&params, remaining, require_complete_active_coverage)
+                    .paginate_algo_history(
+                        &params,
+                        remaining,
+                        require_complete_active_coverage,
+                        history_page_limit,
+                    )
                     .await
                 {
                     Ok(sweep) => sweep,

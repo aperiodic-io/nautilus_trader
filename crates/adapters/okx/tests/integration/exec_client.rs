@@ -5796,6 +5796,260 @@ async fn test_generate_mass_status_preserves_reports_when_algo_history_is_unavai
     assert_eq!(history_attempts.load(Ordering::Relaxed), expected_attempts);
 }
 
+#[derive(Default)]
+struct HistoryPageCounts {
+    orders_pending: AtomicUsize,
+    orders_history: AtomicUsize,
+    algo_pending: AtomicUsize,
+    algo_history: AtomicUsize,
+    fills: AtomicUsize,
+    positions: AtomicUsize,
+}
+
+fn history_page(template: &serde_json::Value, id_fields: &[&str], page: usize) -> Response {
+    let rows: Vec<serde_json::Value> = (0..100)
+        .map(|index| {
+            let mut row = template.clone();
+            for field in id_fields {
+                row[*field] = json!(format!("{}", page * 100 + index + 1));
+            }
+            row
+        })
+        .collect();
+    Json(json!({"code": "0", "msg": "", "data": rows})).into_response()
+}
+
+fn empty_page() -> Response {
+    Json(json!({"code": "0", "msg": "", "data": []})).into_response()
+}
+
+fn fill_history_response(
+    counts: &HistoryPageCounts,
+    template: &serde_json::Value,
+    full_history: bool,
+) -> Response {
+    let page = counts.fills.fetch_add(1, Ordering::Relaxed);
+    if full_history {
+        history_page(template, &["billId", "tradeId"], page)
+    } else {
+        empty_page()
+    }
+}
+
+// Serves empty open orders and positions, and either empty or endlessly full history pages
+async fn start_history_page_test_server(
+    counts: Arc<HistoryPageCounts>,
+    full_history: bool,
+) -> SocketAddr {
+    let order_template = load_test_data("http_get_orders_history.json")["data"][0].clone();
+    let mut algo_template = load_test_data("http_get_orders_algo_history.json")["data"][0].clone();
+    algo_template["state"] = json!("canceled");
+    let mut fill_template = load_test_data("http_transaction_detail.json");
+    fill_template["instType"] = json!("SWAP");
+    fill_template["instId"] = json!("BTC-USDT-SWAP");
+
+    let pending_counts = Arc::clone(&counts);
+    let history_counts = Arc::clone(&counts);
+    let algo_pending_counts = Arc::clone(&counts);
+    let algo_history_counts = Arc::clone(&counts);
+    let fill_counts = Arc::clone(&counts);
+    let fill_history_counts = Arc::clone(&counts);
+    let position_counts = counts;
+
+    let fill_history_template = fill_template.clone();
+
+    let router = Router::new()
+        .route(
+            "/api/v5/trade/orders-pending",
+            get(move || {
+                pending_counts
+                    .orders_pending
+                    .fetch_add(1, Ordering::Relaxed);
+                async { empty_page() }
+            }),
+        )
+        .route(
+            "/api/v5/trade/orders-history",
+            get(move || {
+                let page = history_counts
+                    .orders_history
+                    .fetch_add(1, Ordering::Relaxed);
+                let response = if full_history {
+                    history_page(&order_template, &["ordId", "clOrdId"], page)
+                } else {
+                    empty_page()
+                };
+                async { response }
+            }),
+        )
+        .route(
+            "/api/v5/trade/orders-algo-pending",
+            get(move || {
+                algo_pending_counts
+                    .algo_pending
+                    .fetch_add(1, Ordering::Relaxed);
+                async { empty_page() }
+            }),
+        )
+        .route(
+            "/api/v5/trade/orders-algo-history",
+            get(move || {
+                let page = algo_history_counts
+                    .algo_history
+                    .fetch_add(1, Ordering::Relaxed);
+                let response = if full_history {
+                    history_page(&algo_template, &["algoId", "algoClOrdId"], page)
+                } else {
+                    empty_page()
+                };
+                async { response }
+            }),
+        )
+        .route(
+            "/api/v5/trade/fills",
+            get(move || {
+                let response = fill_history_response(&fill_counts, &fill_template, full_history);
+                async { response }
+            }),
+        )
+        .route(
+            "/api/v5/trade/fills-history",
+            get(move || {
+                let response = fill_history_response(
+                    &fill_history_counts,
+                    &fill_history_template,
+                    full_history,
+                );
+                async { response }
+            }),
+        )
+        .route(
+            "/api/v5/account/positions",
+            get(move || {
+                position_counts.positions.fetch_add(1, Ordering::Relaxed);
+                async { empty_page() }
+            }),
+        )
+        .route(
+            "/api/v5/account/balance",
+            get(|| async { Json(load_test_data("http_get_account_balance.json")).into_response() }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+    addr
+}
+
+#[rstest]
+#[case::one_page(Some(1), 1)]
+#[case::two_pages(Some(2), 2)]
+#[case::skipped(Some(0), 0)]
+#[tokio::test]
+async fn test_generate_mass_status_limits_history_pages(
+    #[case] max_reconciliation_history_pages: Option<u32>,
+    #[case] expected_pages: usize,
+) {
+    let counts = Arc::new(HistoryPageCounts::default());
+    let addr = start_history_page_test_server(Arc::clone(&counts), true).await;
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+            config.max_reconciliation_history_pages = max_reconciliation_history_pages;
+        });
+    client.on_instrument(btc_usdt_swap_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+
+    // Four algo order types, each with three history states
+    let algo_history_sweeps = 4 * 3;
+    assert_eq!(
+        counts.orders_history.load(Ordering::Relaxed),
+        expected_pages
+    );
+    assert_eq!(
+        counts.algo_history.load(Ordering::Relaxed),
+        algo_history_sweeps * expected_pages
+    );
+    assert_eq!(counts.fills.load(Ordering::Relaxed), expected_pages);
+    // Open orders and positions are always requested in full
+    assert_eq!(counts.orders_pending.load(Ordering::Relaxed), 1);
+    assert_eq!(counts.algo_pending.load(Ordering::Relaxed), 4);
+    assert!(counts.positions.load(Ordering::Relaxed) > 0);
+    // Truncated or skipped history never claims complete coverage
+    assert!(!mass_status.reports_complete());
+}
+
+#[rstest]
+#[case::default_cap(None, 1, true)]
+#[case::limited(Some(3), 1, true)]
+#[case::skipped(Some(0), 0, false)]
+#[tokio::test]
+async fn test_generate_mass_status_history_page_limit_completeness(
+    #[case] max_reconciliation_history_pages: Option<u32>,
+    #[case] expected_history_requests: usize,
+    #[case] expected_complete: bool,
+) {
+    let counts = Arc::new(HistoryPageCounts::default());
+    let addr = start_history_page_test_server(Arc::clone(&counts), false).await;
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+            config.max_reconciliation_history_pages = max_reconciliation_history_pages;
+        });
+    client.on_instrument(btc_usdt_swap_instrument());
+
+    let mass_status = client.generate_mass_status(None).await.unwrap().unwrap();
+
+    assert_eq!(
+        counts.orders_history.load(Ordering::Relaxed),
+        expected_history_requests
+    );
+    assert_eq!(
+        counts.algo_history.load(Ordering::Relaxed),
+        4 * 3 * expected_history_requests
+    );
+    assert_eq!(
+        counts.fills.load(Ordering::Relaxed),
+        expected_history_requests
+    );
+    assert_eq!(counts.orders_pending.load(Ordering::Relaxed), 1);
+    assert_eq!(counts.algo_pending.load(Ordering::Relaxed), 4);
+    assert!(counts.positions.load(Ordering::Relaxed) > 0);
+    assert_eq!(mass_status.reports_complete(), expected_complete);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_order_status_reports_ignore_history_page_limit() {
+    let counts = Arc::new(HistoryPageCounts::default());
+    let addr = start_history_page_test_server(Arc::clone(&counts), false).await;
+    let (mut client, _rx, _cache) =
+        create_test_execution_client_configured(&format!("http://{addr}"), |config| {
+            config.instrument_types = vec![OKXInstrumentType::Swap];
+            config.max_reconciliation_history_pages = Some(0);
+        });
+    client.on_instrument(btc_usdt_swap_instrument());
+    let cmd = GenerateOrderStatusReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    client.generate_order_status_reports(&cmd).await.unwrap();
+
+    assert_eq!(counts.orders_history.load(Ordering::Relaxed), 1);
+    assert_eq!(counts.orders_pending.load(Ordering::Relaxed), 1);
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_generate_mass_status_does_not_invent_net_flat_for_cached_hedge_position() {
